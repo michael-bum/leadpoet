@@ -3113,26 +3113,58 @@ class Validator(BaseValidatorNeuron):
             # ═══════════════════════════════════════════════════════════════════
             UID_ZERO = 0  # LeadPoet revenue UID
             EXPECTED_UID_ZERO_HOTKEY = "5FNVgRnrxMibhcBGEAaajGrYjsaCn441a5HuGUBUNnxEBLo9"
-            
+
+            # Read ff_enabled EARLY (used by the no-sourcing-data gates below)
+            # so the validator doesn't 100%-burn when sourcing is zeroed out but
+            # fulfillment requests were scored this epoch.  Historically these
+            # gates short-circuited whenever rolling_scores was empty, which
+            # broke once sourcing emissions were dropped to 0% (no incentive
+            # → no rolling_scores → 100% burn even with active fulfillment).
+            ff_enabled = os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true"
+
             # ═══════════════════════════════════════════════════════════════════
             # SOURCING EMISSIONS SYSTEM (Threshold-Based)
             # ═══════════════════════════════════════════════════════════════════
+            # ╔══════════════════════════════════════════════════════════════════╗
+            # ║ ⚠️  THE LEADERBOARD IS PART OF FULFILLMENT — DO NOT TURN IT OFF ║
+            # ╠══════════════════════════════════════════════════════════════════╣
+            # ║ When the team or an operator says "fulfillment is N%", the      ║
+            # ║ leaderboard (LEADERBOARD_BONUS_SHARE) is INCLUDED in that N%.   ║
+            # ║ The leaderboard is the lifetime-top-3 bonus that lives inside   ║
+            # ║ the fulfillment track — it rewards sustained high performance   ║
+            # ║ on top of per-epoch payouts.                                    ║
+            # ║                                                                  ║
+            # ║ When tuning the split, change the RATIO between                 ║
+            # ║   FULFILLMENT_POOL_SHARE  (per-epoch winners)                   ║
+            # ║   LEADERBOARD_BONUS_SHARE (lifetime top-3)                      ║
+            # ║ but never set LEADERBOARD_BONUS_SHARE to 0 — that disables the  ║
+            # ║ leaderboard entirely, which is NOT what "fulfillment X%" means. ║
+            # ║                                                                  ║
+            # ║ Current default: 95% fulfillment-flavored total =               ║
+            # ║   91% per-epoch + 4% leaderboard (2.5/1.0/0.5).                 ║
+            # ║                                                                  ║
+            # ║ History: 322f287d (2026-05-15) zeroed the leaderboard while     ║
+            # ║ raising the per-epoch pool to 95%, mistakenly interpreting      ║
+            # ║ "95% fulfillment" as "per-epoch only".  Restored in d3558afa    ║
+            # ║ the same day.  This banner exists so it doesn't happen again.   ║
+            # ╚══════════════════════════════════════════════════════════════════╝
             # Allocation shares (dynamic based on champion status)
             BASE_BURN_SHARE = 0.0          # 0% base burn to UID 0
             CHAMPION_SHARE = 0.05          # 5% to qualification model champion (when active)
-            FULFILLMENT_POOL_SHARE = 0.95  # 95% reserved for per-epoch fulfillment rewards
-            # FULFILLMENT LEADERBOARD BONUS — added 2026-04-30, ZEROED 2026-05-15.
-            # Previously carved 4% from the fulfillment pool for top-3 all-time
-            # winners (2.5 + 1.0 + 0.5).  Disabled because the team chose to
-            # concentrate emissions on per-epoch fulfillment (95%) and
-            # qualification champion (5%) only — sourcing miners get 0% and
-            # the leaderboard carve is rolled into the per-epoch fulfillment
-            # pool.  Per-share percentages kept as commented-out reference so
-            # the historical layout is recoverable.
-            LEADERBOARD_BONUS_SHARE = 0.0    # was 0.04 (2.5 + 1.0 + 0.5)
-            LEADERBOARD_TOP1_PCT     = 0.0   # was 0.025 (#1)
-            LEADERBOARD_TOP2_PCT     = 0.0   # was 0.010 (#2)
-            LEADERBOARD_TOP3_PCT     = 0.0   # was 0.005 (#3)
+            # FULFILLMENT-FLAVORED TOTAL = 95% (sourcing is zeroed, champion is 5%).
+            # That 95% is split into a per-epoch fulfillment pool and a top-3
+            # all-time leaderboard bonus.  The leaderboard is a permanent
+            # feature of the fulfillment track — it is NEVER toggled off; only
+            # the split ratio between per-epoch and lifetime is tunable here.
+            FULFILLMENT_POOL_SHARE = 0.91  # 91% reserved for per-epoch fulfillment rewards
+            # FULFILLMENT LEADERBOARD BONUS — added 2026-04-30, restored 2026-05-15
+            # after a brief misconfiguration.  Top-3 all-time fulfillment winners
+            # get this bonus on top of per-epoch payouts.  Carved from the 95%
+            # fulfillment-flavored total (95 = 91 per-epoch + 4 leaderboard).
+            LEADERBOARD_BONUS_SHARE = 0.04   # 4% total: 2.5 + 1.0 + 0.5
+            LEADERBOARD_TOP1_PCT     = 0.025 # 2.5% to all-time #1
+            LEADERBOARD_TOP2_PCT     = 0.010 # 1.0% to all-time #2
+            LEADERBOARD_TOP3_PCT     = 0.005 # 0.5% to all-time #3
             # MAX_SOURCING_SHARE is computed dynamically:
             #   No champion, no fulfillment → 100% to sourcing miners
             #   Both active → 20% sourcing, 5% champion, 71% fulfillment pool, 4% leaderboard bonus
@@ -3185,9 +3217,15 @@ class Validator(BaseValidatorNeuron):
             # Check if we have ANYTHING to submit (current OR rolling)
             # If both are empty, submit 100% burn weights
             # ═══════════════════════════════════════════════════════════════════
-            if not miner_scores and not rolling_scores:
+            # Only short-circuit to 100% burn when BOTH sourcing tracks are empty
+            # AND fulfillment is disabled on this validator.  When ff_enabled is
+            # true we MUST proceed to the main distribution path even with empty
+            # sourcing data, otherwise fulfillment miners get nothing despite
+            # successfully scoring requests this epoch (the 95% fulfillment pool
+            # would silently burn).
+            if not miner_scores and not rolling_scores and not ff_enabled:
                 print(f"   ⚠️  No current epoch OR rolling epoch data for epoch {current_epoch}")
-                print(f"   🔥 Submitting 100% burn weights (first epoch or history cleared)...")
+                print(f"   🔥 Submitting 100% burn weights (sourcing-only validator, no data)...")
                 
                 try:
                     # Verify UID 0 is correct before burning
@@ -3279,12 +3317,14 @@ class Validator(BaseValidatorNeuron):
             # Fulfillment pool is ALWAYS reserved (75%). If fulfillment is disabled
             # on this validator, or no miners earned rewards this epoch, the unused
             # portion flows to burn — it does NOT redistribute back to sourcing.
-            ff_enabled = os.environ.get("ENABLE_FULFILLMENT", "false").lower() == "true"
+            # (ff_enabled is read once at the top of the function so the early
+            #  no-sourcing-data gates above can honor it; do not re-read here.)
             # MAX_SOURCING_SHARE is strictly 0% under the 2026-05-15 split:
             # 5% champion (reserved even when inactive — burns instead of
-            # falling back to sourcing) + 95% fulfillment + 0% leaderboard =
-            # 100%.  Sourcing miners get nothing; the qualification track
-            # incentive is concentrated entirely on the champion slot.
+            # falling back to sourcing) + 91% per-epoch fulfillment + 4%
+            # fulfillment leaderboard = 100%.  Sourcing miners get nothing;
+            # qualification incentive is concentrated on the champion slot,
+            # fulfillment incentive on per-epoch winners and the lifetime top-3.
             MAX_SOURCING_SHARE = (
                 1.0
                 - CHAMPION_SHARE
@@ -3319,7 +3359,12 @@ class Validator(BaseValidatorNeuron):
                 except Exception as e:
                     print(f"   ⚠️  Skipping miner {hotkey[:10]}...: {e}")
             
-            if not hotkey_to_uid:
+            # Same logic as Gate A above: only short-circuit if fulfillment is
+            # disabled.  When ff_enabled=true the downstream code distributes
+            # the fulfillment pool using metagraph.hotkeys directly (it does
+            # not depend on hotkey_to_uid, which is sourcing-only), so an
+            # empty sourcing roster must NOT block fulfillment payouts.
+            if not hotkey_to_uid and not ff_enabled:
                 # FALLBACK: No valid miner UIDs found - submit burn weights
                 print(f"   ⚠️  No valid miner UIDs found")
                 print(f"      Miners have left the subnet or are not registered")
@@ -3469,13 +3514,21 @@ class Validator(BaseValidatorNeuron):
                     f"(safe fallback — full {effective_leaderboard_share*100:.2f}% to burn): {e}"
                 )
 
-            # Calculate total burn share
-            # Includes: threshold shortfall + deregistered miners + unused fulfillment pool +
-            # leaderboard slots that fell through (deregistered top-N or fewer than 3 winners)
+            # Calculate total burn share.
+            # Includes: threshold shortfall + deregistered miners + unused
+            # fulfillment pool + leaderboard fall-through + unallocated champion.
+            # The CHAMPION_SHARE bucket is RESERVED whether or not a champion
+            # is active — when inactive, the 5% must explicitly flow to burn
+            # so the weight vector still sums to 1.0.  Without unused_champion
+            # the totals collapsed to 0.95 and the weight-sum check at the
+            # bottom of this function failed (regression introduced in
+            # 322f287d when MAX_SOURCING_SHARE stopped absorbing the share).
             unused_sourcing_share = MAX_SOURCING_SHARE - effective_sourcing_share
+            unused_champion = CHAMPION_SHARE - effective_champion_share
             total_burn_share = (
                 BASE_BURN_SHARE
                 + unused_sourcing_share
+                + unused_champion
                 + dereg_burn
                 + unused_fulfillment
                 + leaderboard_burn
@@ -3485,6 +3538,7 @@ class Validator(BaseValidatorNeuron):
             leaderboard_paid = sum(leaderboard_per_uid.values())
             print(f"   📊 WEIGHT DISTRIBUTION:")
             print(f"      Unused sourcing:      {unused_sourcing_share*100:.2f}% (threshold shortfall)")
+            print(f"      Unused champion:      {unused_champion*100:.2f}% (no active champion)")
             print(f"      Unused fulfillment:   {unused_fulfillment*100:.2f}%")
             print(f"      Deregistered miners:  {dereg_burn*100:.2f}%")
             print(f"      Leaderboard burn:     {leaderboard_burn*100:.2f}%")
