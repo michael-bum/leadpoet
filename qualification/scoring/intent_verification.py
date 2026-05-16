@@ -2775,8 +2775,139 @@ def extract_verification_content(html_or_json: str, source: str) -> str:
         except (json.JSONDecodeError, ValueError):
             pass
 
+    # Handle social_media responses. fetch_url_content routes by hostname to
+    # platform-specific ScrapingDog endpoints that return EITHER pre-formatted
+    # text blobs (Instagram/TikTok/YouTube, via our _format_* helpers) OR raw
+    # JSON (X/Twitter — no formatter on the fetch side). Both shapes feed back
+    # here as a single string. Without dedicated routing they fall to
+    # _extract_html_content, where BeautifulSoup finds no <body> tag and
+    # silently returns "" — burning the ScrapingDog credit and causing
+    # `confidence=0` / `date_status="fabricated"` on legitimate signals.
+    if source_lower == "social_media":
+        stripped = html_or_json.lstrip() if html_or_json else ""
+        if stripped.startswith("["):
+            # Pre-formatted blob: "[INSTAGRAM PROFILE]\n...", "[TIKTOK PROFILE]\n...",
+            # "[YOUTUBE VIDEO]\n...". The leading bracket can also be a JSON array,
+            # so try JSON parsing first; if it parses, treat as data, else as text.
+            try:
+                _ = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                return html_or_json[:CONTENT_MAX_LENGTH]
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                data = json.loads(stripped)
+                blob = _extract_x_content(data)
+                if blob:
+                    return blob[:CONTENT_MAX_LENGTH]
+            except (json.JSONDecodeError, ValueError):
+                pass
+        # Fall through to HTML parser for Facebook/Reddit/Threads/etc.
+        # (these come from scrapingdog_generic which returns HTML).
+
     # Handle HTML content
     return _extract_html_content(html_or_json, source_lower)
+
+
+def _extract_x_content(data) -> str:
+    """Extract verifiable text from ScrapingDog X/Twitter JSON.
+
+    Verified against live ScrapingDog responses 2026-05-15:
+
+      X POST API (/x/post) — top-level "tweet" string + nested "user":
+        {tweet, full_tweet, created_at, likes, retweets, quotes, views,
+         user: {profile_name, profile_handle (no @), description,
+                followers_count, following_count, statuses_count, verified,
+                is_blue_verified, location, ...}}
+
+      X PROFILE API (/x/profile) — top-level "profile" wrapper:
+        {profile: {name, username ("@xxx"), description, location,
+                   website, verified, is_blue_verified,
+                   stats: {followers, following, tweets, ...}}}
+
+    Returns "" if the payload matches neither shape (caller falls through).
+    """
+    if not isinstance(data, dict):
+        return ""
+
+    # POST API: top-level "tweet" string is the marker.
+    tweet_text = data.get("tweet") or data.get("full_tweet")
+    if isinstance(tweet_text, str) and tweet_text.strip():
+        parts = ["[X/TWITTER POST]"]
+        user = data.get("user") if isinstance(data.get("user"), dict) else {}
+        handle = (user.get("profile_handle") or user.get("screen_name") or "").lstrip("@")
+        name = user.get("profile_name") or user.get("name")
+        if name or handle:
+            parts.append(f"Author: {name or ''} (@{handle or '?'})")
+        if data.get("created_at"):
+            parts.append(f"Posted: {data['created_at']}")
+        parts.append(f"Tweet: {tweet_text}")
+        for metric_key, label in (("likes", "Likes"), ("retweets", "Retweets"),
+                                  ("quotes", "Quotes"), ("views", "Views")):
+            v = data.get(metric_key)
+            if v:
+                parts.append(f"{label}: {v}")
+        return "\n".join(parts)
+
+    # PROFILE API: wrapped under "profile" (current ScrapingDog shape).
+    # Also accept legacy "user" wrap or top-level (older docs / alt responses).
+    profile = (
+        data.get("profile") if isinstance(data.get("profile"), dict)
+        else (data.get("user") if isinstance(data.get("user"), dict) else data)
+    )
+    if not isinstance(profile, dict):
+        return ""
+
+    # Handle/username may carry an "@" prefix (Profile API) or not (others).
+    handle = (
+        profile.get("username")
+        or profile.get("profile_handle")
+        or profile.get("screen_name")
+    )
+    if handle:
+        handle = str(handle).lstrip("@")
+    if not handle:
+        return ""
+
+    parts = ["[X/TWITTER PROFILE]", f"Handle: @{handle}"]
+    display_name = profile.get("name") or profile.get("profile_name")
+    if display_name:
+        parts.append(f"Display name: {display_name}")
+    desc = profile.get("description") or profile.get("bio")
+    if desc:
+        parts.append(f"Bio: {desc}")
+    if profile.get("location"):
+        parts.append(f"Location: {profile['location']}")
+    website = profile.get("website") or profile.get("url")
+    if website:
+        parts.append(f"Website: {website}")
+
+    # Stats may be nested under "stats" (Profile API) or flat (Post API's user obj).
+    stats = profile.get("stats") if isinstance(profile.get("stats"), dict) else profile
+    followers = (
+        stats.get("followers") or stats.get("followers_count")
+        or profile.get("followers_count")
+    )
+    if followers is not None:
+        parts.append(f"Followers: {followers}")
+    following = (
+        stats.get("following") or stats.get("following_count")
+        or profile.get("following_count") or profile.get("friends_count")
+    )
+    if following is not None:
+        parts.append(f"Following: {following}")
+    tweets = (
+        stats.get("tweets") or stats.get("statuses_count")
+        or profile.get("statuses_count")
+    )
+    if tweets is not None:
+        parts.append(f"Total posts: {tweets}")
+
+    verified = profile.get("verified")
+    if verified is None:
+        verified = profile.get("is_blue_verified")
+    if verified is not None:
+        parts.append(f"Verified: {bool(verified)}")
+    return "\n".join(parts)
 
 
 def _extract_linkedin_content(json_str: str) -> str:
