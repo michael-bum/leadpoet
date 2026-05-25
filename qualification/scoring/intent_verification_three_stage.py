@@ -76,7 +76,7 @@ MAX_SCRAPED_CHARS = 60_000
 SCRAPE_TIMEOUT = 60
 
 JS_HEAVY_HOSTS = (
-    "indeed.com", "builtin.com", "linkedin.com", "glassdoor.com",
+    "indeed.com", "builtin.com", "linkedin.com",
     "ziprecruiter.com", "lever.co", "greenhouse.io",
 )
 ANTI_BOT_HOSTS = (
@@ -88,6 +88,45 @@ ANTI_BOT_MARKERS = [
     "ddos protection", "challenge-platform", "access denied",
     "security check",
 ]
+
+HOST_SCRAPE_CONFIG = {
+    "ziprecruiter.com": {"dynamic": "true", "wait": "15000",
+                         "premium": "true", "stealth_mode": "true"},
+    "wellfound.com":    {"dynamic": "true", "wait": "15000"},
+    "glassdoor.com":    {},
+    "builtin.com":      {},
+}
+
+
+JOB_BOARD_HOSTS = (
+    "indeed.com", "builtin.com", "builtinnyc.com",
+    "lever.co", "wellfound.com", "ziprecruiter.com",
+    "greenhouse.io", "glassdoor.com",
+    "startup.jobs", "remoterocketship.com", "salesjobs.com",
+    "myworkdayjobs.com",
+)
+JOB_BODY_ANCHORS = (
+    "responsibilities", "qualifications", "requirements",
+    "about the role", "about the position", "about this role",
+    "what you'll do", "what you will do", "what you’ll do",
+    "we are looking for", "we're looking for", "we are seeking",
+    "we’re looking for",
+    "apply now", "apply for this job", "submit application",
+    "job description",
+    "job_position:", "job_description",
+)
+
+
+def _looks_like_job_body(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    return any(a in low for a in JOB_BODY_ANCHORS)
+
+
+def _is_job_board_url(url: str) -> bool:
+    host = _host(url)
+    return any(h in host for h in JOB_BOARD_HOSTS)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -171,12 +210,20 @@ async def _scrape_sd_hardened(url: str) -> Dict[str, Any]:
 
     host = _host(url)
     params = {"api_key": api_key, "url": url, "format": "markdown"}
-    if any(h in host for h in JS_HEAVY_HOSTS):
-        params["dynamic"] = "true"
-        params["wait"] = "5000"
-    if any(h in host for h in ANTI_BOT_HOSTS):
-        params["premium"] = "true"
-        params["stealth_mode"] = "true"
+
+    override = next(
+        (cfg for h, cfg in HOST_SCRAPE_CONFIG.items() if h in host),
+        None,
+    )
+    if override is not None:
+        params.update(override)
+    else:
+        if any(h in host for h in JS_HEAVY_HOSTS):
+            params["dynamic"] = "true"
+            params["wait"] = "5000"
+        if any(h in host for h in ANTI_BOT_HOSTS):
+            params["premium"] = "true"
+            params["stealth_mode"] = "true"
 
     content = None
     last_err = None
@@ -203,7 +250,7 @@ async def _scrape_sd_hardened(url: str) -> Dict[str, Any]:
     if not _looks_textual(content):
         return {"ok": False, "stage": "binary_blob",
                 "content": "", "error": "non_textual_content"}
-    if _has_anti_bot_marker(content):
+    if _has_anti_bot_marker(content) and override is None:
         params["premium"] = "true"
         params["stealth_mode"] = "true"
         try:
@@ -262,6 +309,138 @@ async def _scrape_exa(url: str) -> Dict[str, Any]:
         return {"ok": False, "stage": "exa_thin",
                 "content": text, "error": "<300 chars"}
     return {"ok": True, "stage": "exa_scraped", "content": text, "error": None}
+
+
+# ─────────────────────────────────────────────────────────────────────
+# LinkedIn-aware routing
+# ─────────────────────────────────────────────────────────────────────
+_LINKEDIN_JOB_ID_RE = re.compile(
+    r"linkedin\.com/jobs/view/(?:[^/?#]*-)?(\d+)", re.IGNORECASE,
+)
+
+_LINKEDIN_JOB_CLOSED_RE = re.compile(
+    r"(?i)\b("
+    r"no longer accepting applications?"
+    r"|no longer accepting"
+    r"|applications? (?:are )?closed"
+    r"|this job is closed"
+    r"|position (?:has been )?filled"
+    r"|we are no longer hiring"
+    r"|job is no longer available"
+    r"|expired"
+    r")\b"
+)
+
+_LINKEDIN_REL_DATE_RE = re.compile(
+    r"(?i)(\d+)\s+(year|month|week|day|hour|minute)s?\s+ago"
+)
+
+LINKEDIN_JOB_MAX_AGE_MONTHS = 6
+
+
+def _extract_linkedin_job_id(url: str) -> Optional[str]:
+    m = _LINKEDIN_JOB_ID_RE.search(url or "")
+    return m.group(1) if m else None
+
+
+def _parse_relative_age_to_months(s: str) -> Optional[float]:
+    """Convert 'N <unit> ago' → months (float).  Returns None if unrecognized."""
+    if not s:
+        return None
+    m = _LINKEDIN_REL_DATE_RE.search(s)
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    if unit == "year":
+        return n * 12.0
+    if unit == "month":
+        return float(n)
+    if unit == "week":
+        return n / 4.345
+    if unit in ("day", "hour", "minute"):
+        return n / 30.0 if unit == "day" else 0.0
+    return None
+
+
+async def _scrape_linkedin_job(url: str) -> Dict[str, Any]:
+    api_key = os.environ.get("SCRAPINGDOG_API_KEY") or os.environ.get(
+        "QUALIFICATION_SCRAPINGDOG_API_KEY"
+    )
+    if not api_key:
+        return {"ok": False, "stage": "no_sd_key",
+                "content": "", "error": "missing key"}
+    job_id = _extract_linkedin_job_id(url)
+    if not job_id:
+        return {"ok": False, "stage": "linkedin_jobs_no_id",
+                "content": "", "error": "could not extract job_id"}
+    try:
+        async with httpx.AsyncClient() as cli:
+            r = await cli.get(
+                "https://api.scrapingdog.com/linkedinjobs",
+                params={"api_key": api_key, "job_id": job_id},
+                timeout=SCRAPE_TIMEOUT,
+            )
+    except Exception as e:
+        return {"ok": False, "stage": "linkedin_jobs_failed",
+                "content": "", "error": f"{type(e).__name__}: {str(e)[:120]}"}
+    if r.status_code != 200:
+        return {"ok": False, "stage": "linkedin_jobs_http_error",
+                "content": "", "error": f"HTTP {r.status_code}"}
+    try:
+        data = r.json()
+    except Exception as e:
+        return {"ok": False, "stage": "linkedin_jobs_parse_error",
+                "content": "", "error": f"{type(e).__name__}"}
+    if isinstance(data, list):
+        data = data[0] if data else {}
+    if not isinstance(data, dict) or not data.get("job_position"):
+        return {"ok": False, "stage": "linkedin_jobs_empty",
+                "content": "", "error": "no job fields in response"}
+
+    parts: List[str] = []
+    jobs_status = data.get("jobs_status")
+    if jobs_status:
+        parts.append(f"jobs_status: {jobs_status}")
+    posted = data.get("job_posting_time")
+    if posted:
+        parts.append(f"posted: {posted}")
+    for key in ("job_position", "company_name", "job_location",
+                "Employment_type", "Seniority_level", "Industries",
+                "number_of_applicants", "base_pay"):
+        v = data.get(key)
+        if v:
+            parts.append(f"{key}: {v}")
+    desc = data.get("job_description") or ""
+    if desc:
+        parts.append("")
+        parts.append(desc)
+
+    text = "\n".join(parts)[:MAX_SCRAPED_CHARS]
+    if len(text) < 50:
+        return {"ok": False, "stage": "linkedin_jobs_thin",
+                "content": text, "error": "<50 chars"}
+
+    is_closed = bool(jobs_status and _LINKEDIN_JOB_CLOSED_RE.search(jobs_status))
+    months_ago = _parse_relative_age_to_months(posted or "")
+    is_stale = (
+        months_ago is not None and months_ago > LINKEDIN_JOB_MAX_AGE_MONTHS
+    )
+
+    return {
+        "ok": True,
+        "stage": "linkedin_jobs_scraped",
+        "content": text,
+        "error": None,
+        "meta": {
+            "kind": "linkedin_job",
+            "jobs_status": jobs_status,
+            "posted_raw": posted,
+            "months_ago": months_ago,
+            "is_closed": is_closed,
+            "is_stale": is_stale,
+        },
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -464,9 +643,23 @@ Final judge rules:
 - Page titles, navigation menus, headers, and breadcrumbs are NOT evidence.
   Only specific factual claims in the page BODY count.
 - If the body contains explicit negation about the claim ("0 open positions",
-  "no longer open", "not currently hiring", "position has been removed",
-  "page not found", "404", "the job you are looking for is no longer"),
+  "no longer open", "no longer accepting applications", "not currently hiring",
+  "position has been removed", "page not found", "404",
+  "the job you are looking for is no longer"),
   return contradicted regardless of titles, headers, or partial context.
+- Job-posting freshness rule: when the claim is about an active/open job
+  posting (hiring signal), the source MUST show that posting is still open.
+  Treat any of these closed-state phrases as contradicted — even if other
+  parts of the page still describe the role:
+    "no longer accepting applications", "applications are closed",
+    "this job is closed", "position filled", "we are no longer hiring",
+    "job is no longer available", "expired".
+- Job-posting timeline rule: if the source body shows a posting age (e.g.
+  "Posted 7 months ago", "8 months ago", "Posted on 2024-09-12", "Hace 1 año")
+  AND that age is > 6 months from today, return contradicted (stale_posting).
+  Job-board sidebars and "similar jobs" timestamps do NOT count — only the
+  posting age of the ACTUAL job being verified.  If no posting age is
+  visible on the page, do NOT penalize on staleness; judge content only.
 - If exact extracted content directly supports miner_claim AND PART A holds,
   return supported.
 - If extracted content supports only part of miner_claim AND PART A holds,
@@ -494,6 +687,27 @@ async def _fetch_sd_then_exa(
     for url in (urls or [])[:3]:
         if not url:
             continue
+
+        if _extract_linkedin_job_id(url):
+            lij = await _scrape_linkedin_job(url)
+            if lij.get("ok") and lij.get("content"):
+                results.append({
+                    "url": url, "title": "",
+                    "text": lij["content"][:max_chars],
+                    "meta": lij.get("meta") or {},
+                })
+                statuses.append({
+                    "url": url, "source": "scrapingdog_linkedinjobs",
+                    "stage": lij.get("stage"),
+                    "meta": lij.get("meta") or {},
+                })
+                continue
+            statuses.append({
+                "url": url, "source": "scrapingdog_linkedinjobs_fallback",
+                "linkedinjobs_stage": lij.get("stage"),
+                "linkedinjobs_error": lij.get("error"),
+            })
+
         sd = await _scrape_sd_hardened(url)
         if sd.get("ok") and sd.get("content"):
             results.append({
@@ -809,6 +1023,91 @@ async def verify_three_stage(
                         "verification_mode": "source_grounded",
                         "entity_match_reason":
                             "company name absent in fetched content",
+                        "confidence": "high",
+                    }],
+                },
+            }
+
+    for res in (contents.get("results") or []):
+        meta = res.get("meta") or {}
+        if meta.get("kind") != "linkedin_job":
+            continue
+        if meta.get("is_closed"):
+            return {
+                "client_ready": False,
+                "decision": "reject",
+                "rejection_reason": "linkedin_job_closed",
+                "stage1": stage1_info,
+                "scrape": {"statuses": contents.get("statuses") or [],
+                           "result_count": len(contents.get("results") or [])},
+                "stage3": None,
+                "company_check": company_check,
+                "verdict": {
+                    "signal_evaluations": [{
+                        "signal_status": "contradicted",
+                        "verification_mode": "source_grounded",
+                        "entity_match_reason": (
+                            f"LinkedIn /linkedinjobs API reports posting is "
+                            f"closed; jobs_status={meta.get('jobs_status')!r}"
+                        ),
+                        "confidence": "high",
+                    }],
+                },
+            }
+        if meta.get("is_stale"):
+            return {
+                "client_ready": False,
+                "decision": "reject",
+                "rejection_reason": "linkedin_job_stale",
+                "stage1": stage1_info,
+                "scrape": {"statuses": contents.get("statuses") or [],
+                           "result_count": len(contents.get("results") or [])},
+                "stage3": None,
+                "company_check": company_check,
+                "verdict": {
+                    "signal_evaluations": [{
+                        "signal_status": "contradicted",
+                        "verification_mode": "source_grounded",
+                        "entity_match_reason": (
+                            f"LinkedIn posting age {meta.get('months_ago'):.1f}"
+                            f" months exceeds {LINKEDIN_JOB_MAX_AGE_MONTHS}"
+                            f"-month freshness cap "
+                            f"(posted: {meta.get('posted_raw')!r})"
+                        ),
+                        "confidence": "high",
+                    }],
+                },
+            }
+
+    has_linkedin_structured = any(
+        (r.get("meta") or {}).get("kind") == "linkedin_job"
+        for r in (contents.get("results") or [])
+    )
+    is_job_board = any(
+        _is_job_board_url(u) for u in (row.get("claimed_source_urls") or [])
+    )
+    if is_job_board and not has_linkedin_structured:
+        combined_for_gate = "\n".join(
+            (r.get("text") or "") for r in (contents.get("results") or [])
+        )
+        if not _looks_like_job_body(combined_for_gate):
+            return {
+                "client_ready": False,
+                "decision": "reject",
+                "rejection_reason": "job_body_not_in_fetched_content",
+                "stage1": stage1_info,
+                "scrape": {"statuses": contents.get("statuses") or [],
+                           "result_count": len(contents.get("results") or [])},
+                "stage3": None,
+                "company_check": company_check,
+                "verdict": {
+                    "signal_evaluations": [{
+                        "signal_status": "unable_to_verify",
+                        "verification_mode": "source_grounded",
+                        "entity_match_reason": (
+                            "scrape returned shell-only content for a "
+                            "job-board URL — no job body anchors found"
+                        ),
                         "confidence": "high",
                     }],
                 },
