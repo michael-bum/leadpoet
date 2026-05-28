@@ -4565,16 +4565,68 @@ class Validator(BaseValidatorNeuron):
                           f"(of {len(scoring_requests)} total; max parallel = {max(num_workers, 1)})")
 
                     if num_workers > 0:
-                        # ── Container mode: 1 request per worker ──
-                        for req_idx, req in enumerate(requests_to_process):
-                            worker_id = req_idx + 1  # 1-indexed
-                            request_id = req.get("request_id", "")
-                            icp_details = req.get("icp", {})
-                            submissions = req.get("submissions", [])
+                        # ── Container mode: distribute work across workers ──
+                        #
+                        # Original design assigned 1 request per worker. When
+                        # fewer requests than workers were ready (common with
+                        # low client volume), workers 2..N idled while worker
+                        # 1 serially scored every submission of the only
+                        # request. Observed 2026-05-28: 1 request with 4
+                        # submissions × 9-36 leads each stacked on worker 1,
+                        # 9 other workers idle — reveal→consensus lag >34 min
+                        # while 90% of compute was unused.
+                        #
+                        # Fix: when spare worker capacity exists, fan out
+                        # SUBMISSIONS within a request across the spare
+                        # workers. Each worker writes its own work + results
+                        # file; the work file's `submissions` key holds only
+                        # that worker's subset. Phase 2 aggregates per file,
+                        # and gateway scores upsert on (request_id,
+                        # validator_hotkey, lead_id), so multiple per-worker
+                        # submits for the same request_id don't conflict.
+                        assignments = []  # (worker_id, request_id, icp, [subs])
 
-                            if not submissions:
-                                continue
+                        if len(requests_to_process) >= num_workers:
+                            # Plenty of requests — keep original 1-per-worker
+                            # mapping (avoids unnecessary cross-request work
+                            # file proliferation when load is balanced).
+                            for req_idx, req in enumerate(requests_to_process):
+                                worker_id = req_idx + 1
+                                request_id = req.get("request_id", "")
+                                icp_details = req.get("icp", {})
+                                submissions = req.get("submissions", [])
+                                if not submissions:
+                                    continue
+                                assignments.append(
+                                    (worker_id, request_id, icp_details, submissions)
+                                )
+                        else:
+                            # Fewer requests than workers — flatten submissions
+                            # and round-robin them across workers, then group
+                            # by (worker, request) so each work file still
+                            # encodes exactly one request_id.
+                            flat = []
+                            for req in requests_to_process:
+                                request_id = req.get("request_id", "")
+                                icp_details = req.get("icp", {})
+                                for sub in req.get("submissions", []):
+                                    flat.append((request_id, icp_details, sub))
 
+                            by_worker = {}
+                            for idx, (request_id, icp_details, sub) in enumerate(flat):
+                                worker_id = (idx % num_workers) + 1
+                                by_req = by_worker.setdefault(worker_id, {})
+                                if request_id not in by_req:
+                                    by_req[request_id] = (icp_details, [])
+                                by_req[request_id][1].append(sub)
+
+                            for worker_id, by_req in by_worker.items():
+                                for request_id, (icp_details, subs) in by_req.items():
+                                    assignments.append(
+                                        (worker_id, request_id, icp_details, subs)
+                                    )
+
+                        for worker_id, request_id, icp_details, submissions in assignments:
                             # request_id is a UUID — safe for filenames
                             work_file = weights_dir / f"fulfillment_worker_{worker_id}_work_{current_epoch}_{request_id}.json"
                             with open(work_file, 'w') as f:
@@ -4588,7 +4640,9 @@ class Validator(BaseValidatorNeuron):
                             print(f"   📝 Worker {worker_id} → request {request_id[:8]} "
                                   f"({len(submissions)} submission(s))")
 
-                        print(f"   ⏳ Work distributed to {len(requests_to_process)} worker(s)")
+                        unique_workers = len({a[0] for a in assignments})
+                        print(f"   ⏳ Work distributed to {unique_workers} worker(s) "
+                              f"({len(assignments)} work file(s))")
                     else:
                         # ── Inline mode (no containers) — process sequentially ──
                         from qualification.scoring.fulfillment_scorer import (
@@ -9802,10 +9856,28 @@ def run_dedicated_fulfillment_worker(config):
             fid = self.config.neuron.fulfillment_container_id
             weights_dir = Path("validator_weights")
 
-            # Prefer the new per-request layout; fall back to legacy.
-            candidates = sorted(weights_dir.glob(
-                f"fulfillment_worker_{fid}_work_{current_epoch}_*.json"
-            ))
+            # Cross-epoch glob: pick up THIS worker's files from any recent
+            # epoch, bounded by the same TTL Phase 1 uses for its dispatch
+            # lock. Single-epoch globbing was the bug — when an epoch flipped
+            # mid-scoring (Tier 2c attribute-heavy ICPs run 30-60 min and
+            # an epoch is ~70 min), the worker stopped seeing its own
+            # in-flight file while Phase 1's cross-epoch lock kept refusing
+            # to re-dispatch. Result: file orphaned for the full 80-min TTL,
+            # request stuck. Observed 2026-05-28 with request e1bd5ae5:
+            # file fulfillment_worker_1_work_23014_e1bd5ae5...json sat for
+            # 34+ min while worker 1 in epoch 23015 globbed only 23015
+            # files and missed it.
+            _FF_WORK_FILE_TTL_SEC = 80 * 60
+            _now_ts = time.time()
+            candidates = sorted(
+                wf for wf in weights_dir.glob(
+                    f"fulfillment_worker_{fid}_work_*_*.json"
+                )
+                if (_now_ts - wf.stat().st_mtime) < _FF_WORK_FILE_TTL_SEC
+            )
+            # Legacy (pre-per-request layout) — name has no request_id
+            # suffix, so the cross-epoch glob above wouldn't match it.
+            # Keep scoped to current epoch for backward-compat probing.
             legacy = weights_dir / f"fulfillment_worker_{fid}_work_{current_epoch}.json"
             if legacy.exists():
                 candidates.append(legacy)
@@ -9831,6 +9903,29 @@ def run_dedicated_fulfillment_worker(config):
             if len(pending) > 1:
                 print(f"   ⚠️ {len(pending) - 1} additional pending work file(s) will be processed next iteration")
             print(f"{'='*70}")
+
+            # Lease renewal: prevent Phase 1's TTL-bounded dispatch lock from
+            # expiring while this worker is still actively scoring. Without
+            # this, attribute-heavy ICPs running >80 min would age past the
+            # _FF_WORK_FILE_TTL_SEC cliff, Phase 1 would re-dispatch the
+            # same request, and the worker would double-score. Observed
+            # 2026-05-28 on request e1bd5ae5: orphan work file from epoch
+            # 23014 was being processed by worker 1 when at exactly 80 min
+            # (22:30), Phase 1 saw the lock release and re-dispatched
+            # e1bd5ae5 with my new fan-out across workers 1-4. We refresh
+            # mtime every 30 min — leaves 50-min headroom under 80-min TTL.
+            async def _refresh_lease():
+                while True:
+                    await asyncio.sleep(30 * 60)
+                    try:
+                        work_file.touch()
+                        print(f"   🔄 Worker {fid}: lease renewed on {work_file.name}")
+                    except FileNotFoundError:
+                        return  # results submitted; file already cleaned up
+                    except Exception as ex:
+                        print(f"   ⚠️ Worker {fid}: lease renewal failed: {ex}")
+
+            lease_task = asyncio.create_task(_refresh_lease())
 
             try:
                 with open(work_file, 'r') as f:
@@ -9999,6 +10094,13 @@ def run_dedicated_fulfillment_worker(config):
                         "timestamp": time.time(),
                     }, f, indent=2)
                 self._completed_epochs.add(current_epoch)
+            finally:
+                # Stop lease renewal — scoring is over (success or failure).
+                lease_task.cancel()
+                try:
+                    await lease_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         async def run_loop(self):
             """Main loop for dedicated fulfillment worker."""
