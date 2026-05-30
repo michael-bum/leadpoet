@@ -37,6 +37,12 @@ from . import _model
 
 MAX_LEADS_PER_ICP = 5
 
+# Validator config (gateway/qualification/config.py): RUNNING_MODEL_TIMEOUT_SECONDS = 320
+# is the HARD INSTANT-FAIL cap per ICP call.  We cut off at 300 to leave a
+# 20-second margin for downstream serialization / return so the validator
+# never sees us exceed its envelope.
+PER_ICP_TIMEOUT_SECONDS = 300.0
+
 
 def qualify(icp: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Validator entry point.
@@ -52,13 +58,42 @@ def qualify(icp: Dict[str, Any]) -> List[Dict[str, Any]]:
         List of 0 to MAX_LEADS_PER_ICP CompanyOutput dicts, sorted by
         internal score desc. Empty list = honest abstention (no
         candidates verified for this ICP).
+
+    Defensive: returns ``[]`` rather than raising on malformed ICP input
+    (missing required fields). The validator must not crash on us.
     """
-    return asyncio.run(_qualify_async(icp))
+    # Validate input shape — return [] (abstain) rather than raise.
+    if not isinstance(icp, dict):
+        return []
+    intent_signals = icp.get("intent_signals") or []
+    if not isinstance(intent_signals, list) or not intent_signals:
+        return []
+    # First intent must be a non-empty string — the downstream pipeline
+    # uses it as the search/verification target and would crash on None.
+    first_intent = intent_signals[0]
+    if not isinstance(first_intent, str) or not first_intent.strip():
+        return []
+    if not (icp.get("industry") or icp.get("icp_id")):
+        return []
+
+    try:
+        return asyncio.run(_qualify_async(icp))
+    except Exception:
+        # Anything that escaped the per-call error handling — abstain.
+        return []
 
 
 async def _qualify_async(icp: Dict[str, Any]) -> List[Dict[str, Any]]:
     async with httpx.AsyncClient() as client:
-        scored_leads = await _model.qualify_icp(client, icp)
+        try:
+            scored_leads = await asyncio.wait_for(
+                _model.qualify_icp(client, icp),
+                timeout=PER_ICP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # Hit the per-ICP soft cap — abort and abstain rather than
+            # risk crossing the validator's instant-fail threshold.
+            return []
     # `scored_leads` is sorted by score desc; take top-5 and return only
     # the CompanyOutput dict for each. Internal score / icp_fit metadata
     # is dropped — the validator computes its own scoring.
