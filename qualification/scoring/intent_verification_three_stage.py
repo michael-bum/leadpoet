@@ -412,7 +412,14 @@ async def _scrape_sd_hardened(url: str) -> Dict[str, Any]:
         return {"ok": False, "stage": "no_sd_key",
                 "content": "", "error": "missing key"}
 
-    base_params = {"api_key": api_key, "url": url, "format": "markdown"}
+    # Request raw HTML (default) instead of markdown so trafilatura body
+    # extraction (applied to the returned `content` below) can drop
+    # nav/menu/footer/related-posts at the DOM level. SD's markdown
+    # conversion preserves enough boilerplate that the first few thousand
+    # chars are often chrome, not article body — feeding Sonar noise.
+    # If trafilatura is unavailable or fails to extract, the helper returns
+    # the raw HTML unchanged so behavior degrades gracefully.
+    base_params = {"api_key": api_key, "url": url}
     history: List[tuple] = []
     last_status: Optional[int] = None
     last_verdict: str = "no_tier_attempted"
@@ -432,6 +439,14 @@ async def _scrape_sd_hardened(url: str) -> Dict[str, Any]:
                 last_status = r.status_code
                 last_verdict = verdict
                 if verdict == "ok":
+                    # Extract article body from raw HTML before truncation.
+                    # Removes nav/sidebar/footer/related-posts that otherwise
+                    # eat the first chars of the prompt input.
+                    try:
+                        from qualification.scoring.verification_helpers import extract_article_body
+                        body = extract_article_body(body)
+                    except Exception:
+                        pass  # fall through with original content
                     return {"ok": True, "stage": f"sd:{tier_name}",
                             "content": body[:MAX_SCRAPED_CHARS],
                             "error": None, "stage_history": history}
