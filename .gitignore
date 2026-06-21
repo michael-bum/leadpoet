@@ -102,11 +102,18 @@ Leadpoet/api/
 # Local agent handoff transcripts
 .agent_handoffs/
 
+# Cursor-era local instructions/transcripts. Do not commit or use as Codex rules.
+cursor_md_files/
+
 # Codex local instructions (never commit; use ~/.codex/AGENTS.md for global rules)
 AGENTS.md
 AGENTS.override.md
 
 # Local/private Research Lab planning drafts
+leadpoet_research_lab_plan_v5.md
+plan.md
+prompts.md
+research_lab_local_test_report.md
 docs/agent_handoff_loop.md
 docs/leadpoet_research_lab_plan_v5.md
 docs/research_lab_phase*_tracker.md
@@ -161,4 +168,3 @@ notes/
 TODO_*.md
 NOTES_*.md
 DRAFT_*.md
-
