@@ -17,6 +17,10 @@ from typing import Any, Mapping
 TRUTHY = {"1", "true", "yes", "on"}
 logger = logging.getLogger(__name__)
 
+# Single code-level default for the Research Lab loop-start fee. Operators can
+# still override it at runtime with RESEARCH_LAB_LOOP_START_FEE_USD.
+DEFAULT_LOOP_START_FEE_USD = 0.2
+
 
 def _truthy(name: str, default: str = "false") -> bool:
     return os.getenv(name, default).strip().lower() in TRUTHY
@@ -54,7 +58,7 @@ class ResearchLabGatewayConfig:
     weight_mutation_enabled: bool = False
     fulfillment_mutation_enabled: bool = False
     miner_openrouter_key_required: bool = True
-    loop_start_fee_usd: float = 5.0
+    loop_start_fee_usd: float = DEFAULT_LOOP_START_FEE_USD
     internal_api_key: str = ""
     hosted_worker_enabled: bool = False
     hosted_worker_poll_seconds: int = 15
@@ -110,7 +114,7 @@ class ResearchLabGatewayConfig:
             weight_mutation_enabled=_truthy("RESEARCH_LAB_WEIGHT_MUTATION_ENABLED"),
             fulfillment_mutation_enabled=_truthy("RESEARCH_LAB_FULFILLMENT_MUTATION_ENABLED"),
             miner_openrouter_key_required=_truthy("RESEARCH_LAB_MINER_OPENROUTER_KEY_REQUIRED", "true"),
-            loop_start_fee_usd=_float("RESEARCH_LAB_LOOP_START_FEE_USD", 5.0),
+            loop_start_fee_usd=_float("RESEARCH_LAB_LOOP_START_FEE_USD", DEFAULT_LOOP_START_FEE_USD),
             internal_api_key=os.getenv("RESEARCH_LAB_INTERNAL_API_KEY", ""),
             hosted_worker_enabled=_truthy("RESEARCH_LAB_HOSTED_WORKER_ENABLED"),
             hosted_worker_poll_seconds=_int("RESEARCH_LAB_HOSTED_WORKER_POLL_SECONDS", 15),
