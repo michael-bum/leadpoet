@@ -12,12 +12,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from leadpoet_verifier.research_evaluation import build_research_evaluation_score_bundle  # noqa: E402
+from gateway.research_lab.config import ResearchLabGatewayConfig  # noqa: E402
+from gateway.research_lab.worker import (  # noqa: E402
+    HostedResearchLabWorkerError,
+    ResearchLabHostedWorker,
+    _is_claim_race_error,
+    _row_partition,
+    _worker_proxy_env,
+)
 from research_lab.auto_research_prompt import (  # noqa: E402
+    build_default_auto_research_messages,
     build_validated_candidate_manifest,
     coerce_component_registry,
     parse_auto_research_response,
 )
 from research_lab.canonical import sha256_json  # noqa: E402
+from research_lab.eval.private_runtime import DEFAULT_ENV_PASSTHROUGH  # noqa: E402
 from research_lab.eval.artifacts import PrivateModelArtifactManifest  # noqa: E402
 from research_lab.validator_integration import verify_research_lab_evaluation_bundle_page  # noqa: E402
 
@@ -53,6 +63,26 @@ def main() -> int:
     except ValueError:
         pass
 
+    prompt_messages = build_default_auto_research_messages(
+        ticket={"ticket_id": "ticket-1", "run_id": "run-1", "miner_hotkey": "5FminerHotkey111"},
+        artifact_manifest=artifact.to_dict(),
+        component_registry=registry.to_dict(),
+        benchmark_public_summary={"item_count": 3},
+        budget_context={
+            "research_model_tier": "default",
+            "requested_compute_budget_usd": 5.0,
+            "payment_kind": "top_up",
+            "continue_from_run_id": "run-0",
+        },
+        max_candidates=2,
+    )
+    if "budget_context" not in prompt_messages[1]["content"] or "top_up" not in prompt_messages[1]["content"]:
+        errors.append("auto-research prompt did not include budget/top-up context")
+    if "Do not overfit to one supplied market segment" not in prompt_messages[1]["content"]:
+        errors.append("auto-research prompt did not guard against client-specific overfitting")
+    if "HTTPS_PROXY" not in DEFAULT_ENV_PASSTHROUGH or "HTTP_PROXY" not in DEFAULT_ENV_PASSTHROUGH:
+        errors.append("private Docker runner does not pass through proxy env vars")
+
     eval_bundle = _score_bundle()
     page = {
         "schema_version": "1.0",
@@ -73,11 +103,47 @@ def main() -> int:
     if verification["verified_bundle_count"] != 1 or verification["ignored_bundle_count"] != 1:
         errors.append("validator did not ignore non-scored bundle rows")
 
+    rows = [{"run_id": f"run-{idx}"} for idx in range(64)]
+    partitions = {_row_partition(row, 4) for row in rows}
+    if partitions != {0, 1, 2, 3}:
+        errors.append("worker partitioning does not distribute queued runs across all workers")
+    preferred_cfg = ResearchLabGatewayConfig(
+        hosted_worker_enabled=True,
+        production_writes_enabled=True,
+        hosted_runs_enabled=True,
+        receipts_enabled=True,
+        evaluation_bundles_enabled=True,
+        private_benchmark_path="/sealed/benchmark.json",
+        auto_research_model="test/model",
+        hosted_worker_index=2,
+        hosted_worker_total_workers=4,
+        hosted_worker_queue_fetch_limit=64,
+    )
+    preferred_worker = ResearchLabHostedWorker(preferred_cfg, worker_ref="test-worker-3")
+    selected = preferred_worker._select_preferred_queued_row(rows)
+    if not selected or _row_partition(selected, 4) != 2:
+        errors.append("worker did not prefer its assigned queue partition")
+    if not _is_claim_race_error(Exception("duplicate key violates research_loop_run_queue_events_run_seq_key")):
+        errors.append("worker claim-race detector missed queue event duplicate-key errors")
+    proxy_cfg = ResearchLabGatewayConfig(hosted_worker_require_proxy=True, hosted_worker_proxy_url="http://proxy.example:8080")
+    proxy_env = _worker_proxy_env(proxy_cfg)
+    if proxy_env.get("HTTPS_PROXY") != "http://proxy.example:8080" or proxy_env.get("HTTP_PROXY") != "http://proxy.example:8080":
+        errors.append("worker proxy env did not map configured proxy to HTTP/HTTPS proxy variables")
+    missing_proxy_cfg = ResearchLabGatewayConfig(hosted_worker_require_proxy=True)
+    try:
+        ResearchLabHostedWorker(missing_proxy_cfg, worker_ref="test-worker-no-proxy")._require_worker_proxy_for_execution()
+        errors.append("worker accepted missing proxy while proxy enforcement was enabled")
+    except HostedResearchLabWorkerError:
+        pass
+
     if errors:
         for error in errors:
             print(f"ERROR: {error}")
         return 1
-    print("Research Lab hosted worker contracts verified: candidate parser, Engine v1 validation, validator scored-bundle filtering.")
+    print(
+        "Research Lab hosted worker contracts verified: candidate parser, Engine v1 validation, "
+        "validator scored-bundle filtering, worker partitioning, claim-race detection."
+    )
     return 0
 
 
@@ -92,7 +158,7 @@ def _metadata() -> dict[str, object]:
                 {
                     "name": "discovery_query_builder",
                     "purpose": "Build precise search prompts for high-intent lead discovery.",
-                    "input_contract": "ICP and target intent signals",
+                    "input_contract": "ICP and observable intent signals",
                     "output_contract": "Search query template",
                     "ablation_leverage": 1.0,
                     "allowed_patch_types": ["PROMPT_EDIT"],
@@ -136,8 +202,8 @@ def _candidate_response() -> str:
   "candidates": [
     {
       "hypothesis": {
-        "failure_mode": "Queries are too broad for urgent enterprise buying intent.",
-        "mechanism": "Tightening the query template around explicit budget, hiring, and vendor replacement signals should improve precision.",
+        "failure_mode": "Queries are too broad for observable buying intent.",
+        "mechanism": "Tightening the query template around fresh budget, hiring, and vendor replacement signals should improve precision across benchmark ICPs.",
         "expected_improvement": "Higher candidate score on ICPs where intent evidence is fresh and specific.",
         "risk": "Could reduce coverage on sparse markets.",
         "predicted_delta": 3.0,
@@ -147,10 +213,10 @@ def _candidate_response() -> str:
         "patch_type": "PROMPT_EDIT",
         "target_component_id": "discovery_query_builder",
         "patch_doc": {
-          "template_name": "enterprise_intent_query",
+          "template_name": "general_intent_query",
           "new_template": "Find companies matching {icp} with recent budget, hiring, expansion, vendor replacement, or compliance signals tied to {intent_signals}."
         },
-        "redacted_summary": "Tighten discovery query toward fresh enterprise buying-intent evidence."
+        "redacted_summary": "Tighten discovery query toward fresh buying-intent evidence."
       }
     },
     {

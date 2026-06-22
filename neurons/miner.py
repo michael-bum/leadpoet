@@ -3,6 +3,7 @@ import asyncio
 import threading
 import argparse
 import traceback
+import getpass
 import bittensor as bt
 import socket
 from Leadpoet.base.miner import BaseMinerNeuron
@@ -2327,6 +2328,39 @@ def _post_research_lab_json(path: str, payload: dict, *, timeout: int = 60) -> d
     return response.json()
 
 
+def _register_research_lab_openrouter_key(wallet, status: dict) -> tuple[str, str] | None:
+    if status.get("openrouter_key_registration_enabled"):
+        raw_key = getpass.getpass("   OpenRouter API key (hidden; encrypted by gateway): ").strip()
+        if not raw_key:
+            print("❌ OpenRouter API key is required for paid auto-research loops.")
+            return None
+        if not raw_key.startswith("sk-or-v1-"):
+            print("❌ OpenRouter API key must start with sk-or-v1-.")
+            return None
+        import time
+        payload = _research_lab_signed_payload(
+            wallet,
+            {
+                "miner_hotkey": wallet.hotkey.ss58_address,
+                "timestamp": int(time.time()),
+                "idempotency_key": f"research-openrouter-key:{wallet.hotkey.ss58_address}:{int(time.time())}",
+                "openrouter_api_key": raw_key,
+                "key_label": "research-lab-miner-key",
+            },
+        )
+        result = _post_research_lab_json("/research-lab/openrouter-keys", payload, timeout=45)
+        if "error" in result:
+            print(f"❌ OpenRouter key verification failed: HTTP {result.get('status_code')}")
+            print(f"   {result['error']}")
+            return None
+        print("✅ OpenRouter key verified and encrypted by gateway")
+        return str(result["key_ref"]), "encrypted_ref"
+
+    print("❌ This gateway does not have encrypted OpenRouter key registration enabled.")
+    print("   Ask the operator to set RESEARCH_LAB_OPENROUTER_KEY_KMS_KEY_ID.")
+    return None
+
+
 def _brief_sanitized_ref_from_input(value: str) -> str:
     value = value.strip()
     if value.startswith("brief_sanitized:"):
@@ -2335,6 +2369,74 @@ def _brief_sanitized_ref_from_input(value: str) -> str:
         return value
     digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
     return f"brief_sanitized:sha256:{digest}"
+
+
+def _brief_public_summary_from_input(value: str) -> str | None:
+    value = value.strip()
+    if value.startswith("brief_sanitized:"):
+        return None
+    return value[:2000]
+
+
+def _research_lab_default_model_tier(default_tier: str, approved_tiers: dict) -> str:
+    if default_tier:
+        return default_tier
+    if approved_tiers:
+        return sorted(approved_tiers)[0]
+    return "default"
+
+
+def _research_lab_prompt_model_tier(default_tier: str, approved_tiers: dict) -> str:
+    tiers = sorted(str(tier) for tier in approved_tiers) if approved_tiers else [default_tier or "default"]
+    if len(tiers) <= 1:
+        return tiers[0]
+    print("   Available model tiers:")
+    for index, tier in enumerate(tiers, start=1):
+        print(f"     {index}. {tier}")
+    default_choice = default_tier if default_tier in tiers else tiers[0]
+    value = input(f"   Model tier [{default_choice}]: ").strip()
+    if not value:
+        return default_choice
+    if value.isdigit():
+        selected_index = int(value)
+        if 1 <= selected_index <= len(tiers):
+            return tiers[selected_index - 1]
+    if value in tiers:
+        return value
+    print(f"❌ Unknown model tier. Using default: {default_choice}")
+    return default_choice
+
+
+def _research_lab_prompt_budget(label: str, *, default: float, minimum: float, maximum: float) -> float:
+    while True:
+        value = input(f"{label} [{default:.2f}]: ").strip()
+        if not value:
+            return float(default)
+        try:
+            parsed = float(value)
+        except ValueError:
+            print("❌ Enter a number.")
+            continue
+        if parsed < minimum or parsed > maximum:
+            print(f"❌ Budget must be between ${minimum:.2f} and ${maximum:.2f}.")
+            continue
+        return parsed
+
+
+def _research_lab_prompt_int(label: str, *, default: int, minimum: int, maximum: int) -> int:
+    while True:
+        value = input(f"{label} [{default}]: ").strip()
+        if not value:
+            return int(default)
+        try:
+            parsed = int(value)
+        except ValueError:
+            print("❌ Enter an integer.")
+            continue
+        if parsed < minimum or parsed > maximum:
+            print(f"❌ Value must be between {minimum} and {maximum}.")
+            continue
+        return parsed
 
 
 def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
@@ -2348,8 +2450,8 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
     print(f"Gateway: {gateway_url}")
     print("")
     print("Auto-research loops are the current miner research workflow.")
-    print("Miners fund hosted research loops with a TAO loop-start fee and a miner")
-    print("OpenRouter key reference; Leadpoet keeps Exa/ScrapingDog server-side.")
+    print("Miners fund hosted model-improvement loops. Leadpoet runs the private")
+    print("model, sealed benchmark, and server-side data providers.")
     print("")
 
     try:
@@ -2363,13 +2465,19 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
         print(f"❌ Could not reach Research Lab gateway status: {exc}")
         return
 
-    print("Research Lab gateway status:")
-    print(f"  api_enabled: {status.get('api_enabled')}")
-    print(f"  production_writes_enabled: {status.get('production_writes_enabled')}")
-    print(f"  paid_loops_enabled: {status.get('paid_loops_enabled')}")
-    print(f"  hosted_runs_enabled: {status.get('hosted_runs_enabled')}")
-    print(f"  loop_start_fee_usd: {status.get('loop_start_fee_usd')}")
-    print(f"  miner_openrouter_key_required: {status.get('miner_openrouter_key_required')}")
+    worker_status = status.get("hosted_worker") if isinstance(status.get("hosted_worker"), dict) else {}
+    approved_tiers = worker_status.get("approved_model_tiers") if isinstance(worker_status.get("approved_model_tiers"), dict) else {}
+    default_tier = str(worker_status.get("default_model_tier") or "default")
+    default_budget = float(worker_status.get("default_compute_budget_usd") or 5.0)
+    min_budget = float(worker_status.get("min_compute_budget_usd") or 1.0)
+    max_budget = float(worker_status.get("max_compute_budget_usd") or 100.0)
+    loop_fee = float(status.get("loop_start_fee_usd") or 5.0)
+
+    print("Research Lab status:")
+    ready = bool(status.get("api_enabled") and status.get("paid_loops_enabled") and status.get("hosted_runs_enabled"))
+    print(f"  hosted auto-research: {'ready' if ready else 'not ready'}")
+    print(f"  loop-start fee: ${loop_fee:.2f} USD-equivalent in TAO")
+    print(f"  default compute budget: ${default_budget:.2f}")
 
     if not status.get("api_enabled"):
         print("")
@@ -2377,37 +2485,63 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
         return
 
     print("")
-    create_ticket = input("❓ Open a new Research Lab ticket? [Y/n]: ").strip().lower()
-    if create_ticket not in ("", "y", "yes"):
+    run_choice = input("❓ Start new loop or top up an existing promising loop? [new/topup] ").strip().lower() or "new"
+    if run_choice in ("topup", "top-up", "t"):
+        _run_research_lab_topup_flow(
+            wallet=wallet,
+            netuid=netuid,
+            status=status,
+            default_tier=default_tier,
+            default_budget=default_budget,
+            min_budget=min_budget,
+            max_budget=max_budget,
+        )
+        return
+    if run_choice not in ("new", "n", "start"):
+        print("❌ Choose either 'new' or 'topup'.")
         return
 
-    island = input("   Island [generalist]: ").strip() or "generalist"
-    brief_input = input("   Brief text or brief_sanitized ref: ").strip()
+    print("")
+    print("Research focus (optional).")
+    print("Use this to suggest a broad model-improvement area; evaluation remains benchmark-wide.")
+    print("Leave blank to let the system choose the highest-priority general improvement path.")
+    print("Examples: evidence freshness scoring; reducing overbroad matches; source-routing quality.")
+    brief_input = input("   Research focus [benchmark-wide model improvement]: ").strip()
     if not brief_input:
-        print("❌ Brief text/ref is required.")
-        return
+        brief_input = "default: benchmark-wide Leadpoet sourcing-model improvement"
     try:
         brief_sanitized_ref = _brief_sanitized_ref_from_input(brief_input)
+        brief_public_summary = _brief_public_summary_from_input(brief_input)
     except ValueError as exc:
         print(f"❌ {exc}")
         return
 
-    try:
-        requested_loop_count = int(input("   Requested loop count [1]: ").strip() or "1")
-    except ValueError:
-        print("❌ Requested loop count must be an integer.")
-        return
-    if requested_loop_count <= 0:
-        print("❌ Requested loop count must be positive.")
-        return
+    island = "generalist"
+    requested_loop_count = 1
+    research_model_tier = _research_lab_default_model_tier(default_tier, approved_tiers)
+    requested_compute_budget_usd = default_budget
+    max_compute_budget_usd = default_budget
+    advanced = input("❓ Adjust advanced settings? [y/N]: ").strip().lower()
+    if advanced in ("y", "yes"):
+        island = input("   Island [generalist]: ").strip() or "generalist"
+        requested_loop_count = _research_lab_prompt_int("   Requested loop count", default=1, minimum=1, maximum=100)
+        research_model_tier = _research_lab_prompt_model_tier(default_tier, approved_tiers)
+        requested_compute_budget_usd = _research_lab_prompt_budget(
+            "   Compute budget USD",
+            default=default_budget,
+            minimum=min_budget,
+            maximum=max_budget,
+        )
+        max_compute_budget_usd = requested_compute_budget_usd
+    print(
+        f"   Using: island={island}, budget=${requested_compute_budget_usd:.2f}, "
+        f"model_tier={research_model_tier}, loops={requested_loop_count}"
+    )
 
-    key_ref = input("   Miner OpenRouter key ref (encrypted/ephemeral ref only, optional until loop-start): ").strip()
-    if key_ref and _looks_like_raw_research_lab_secret(key_ref):
-        print("❌ Do not paste a raw OpenRouter key. Provide an encrypted_ref or ephemeral_ref.")
+    key_result = _register_research_lab_openrouter_key(wallet, status)
+    if key_result is None:
         return
-    key_handling = None
-    if key_ref:
-        key_handling = "ephemeral_ref" if key_ref.startswith("ephemeral_ref:") else "encrypted_ref"
+    key_ref, key_handling = key_result
 
     import time
     ticket_payload = _research_lab_signed_payload(
@@ -2418,9 +2552,13 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
             "idempotency_key": f"research-ticket:{wallet.hotkey.ss58_address}:{int(time.time())}",
             "island": island,
             "brief_sanitized_ref": brief_sanitized_ref,
+            "brief_public_summary": brief_public_summary,
             "requested_loop_count": requested_loop_count,
             "loop_start_fee_required_usd": float(status.get("loop_start_fee_usd") or 5.0),
-            "miner_openrouter_key_ref": key_ref or None,
+            "research_model_tier": research_model_tier,
+            "requested_compute_budget_usd": requested_compute_budget_usd,
+            "max_compute_budget_usd": max_compute_budget_usd,
+            "miner_openrouter_key_ref": key_ref,
             "miner_openrouter_key_handling": key_handling,
         },
     )
@@ -2438,28 +2576,16 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
     if not status.get("paid_loops_enabled") or not status.get("hosted_runs_enabled"):
         print("")
         print("Paid hosted loop starts are not enabled on this gateway yet.")
-        print("The ticket is open, but this client will not submit a paid loop-start request.")
+        print("The ticket is open, but this miner process will not submit a paid loop-start request.")
         return
 
-    start_now = input("❓ Submit paid loop-start request now? [y/N]: ").strip().lower()
-    if start_now not in ("y", "yes"):
-        return
-
-    if not key_ref:
-        key_ref = input("   Miner OpenRouter key ref (encrypted/ephemeral ref only): ").strip()
-        if not key_ref or _looks_like_raw_research_lab_secret(key_ref):
-            print("❌ A safe OpenRouter key reference is required for paid loop starts.")
-            return
-        key_handling = "ephemeral_ref" if key_ref.startswith("ephemeral_ref:") else "encrypted_ref"
-
-    preflight = input("   OpenRouter key preflight status [passed/failed/not_run]: ").strip() or "not_run"
-    if preflight != "passed":
-        print("❌ Paid loop-start requires a passed OpenRouter key preflight.")
+    start_now = input("❓ Continue to payment and queue this run now? [Y/n]: ").strip().lower()
+    if start_now in ("n", "no"):
         return
 
     dest_coldkey = get_leadpoet_coldkey(netuid)
     print("")
-    print(f"Loop-start fee: ${float(status.get('loop_start_fee_usd') or 5.0):.2f} USD-equivalent in TAO")
+    print(f"Loop-start fee: ${loop_fee:.2f} USD-equivalent in TAO")
     print(f"Payment destination coldkey for netuid {netuid}: {dest_coldkey}")
     print("Paste the block hash and extrinsic index from the TAO transfer.")
     payment_block_hash = input("   Payment block hash: ").strip()
@@ -2482,9 +2608,12 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
             "payment_block_hash": payment_block_hash,
             "payment_extrinsic_index": payment_extrinsic_index,
             "miner_openrouter_key_ref": key_ref,
-            "miner_openrouter_key_handling": key_handling or "encrypted_ref",
+            "miner_openrouter_key_handling": key_handling,
             "miner_openrouter_preflight_status": "passed",
             "requested_loop_count": requested_loop_count,
+            "research_model_tier": research_model_tier,
+            "requested_compute_budget_usd": requested_compute_budget_usd,
+            "max_compute_budget_usd": max_compute_budget_usd,
         },
     )
     loop_result = _post_research_lab_json("/research-lab/loop-start", loop_payload, timeout=600)
@@ -2497,6 +2626,80 @@ def run_research_lab_auto_research_flow(wallet, netuid: int) -> None:
     print(f"   Run ID: {loop_result.get('run_id')}")
     print(f"   Status: {loop_result.get('status')}")
     print(f"   Payment ref: {loop_result.get('payment_ref')}")
+
+
+def _run_research_lab_topup_flow(
+    *,
+    wallet,
+    netuid: int,
+    status: dict,
+    default_tier: str,
+    default_budget: float,
+    min_budget: float,
+    max_budget: float,
+) -> None:
+    import time
+
+    ticket_id = input("   Existing ticket ID: ").strip()
+    continue_from_run_id = input("   Continue from run ID (optional): ").strip()
+    research_model_tier = _research_lab_default_model_tier(default_tier, {})
+    additional_compute_budget_usd = _research_lab_prompt_budget(
+        "   Additional compute budget USD",
+        default=default_budget,
+        minimum=min_budget,
+        maximum=max_budget,
+    )
+    advanced = input("❓ Adjust advanced top-up settings? [y/N]: ").strip().lower()
+    if advanced in ("y", "yes"):
+        worker_status = status.get("hosted_worker") if isinstance(status.get("hosted_worker"), dict) else {}
+        approved_tiers = worker_status.get("approved_model_tiers") if isinstance(worker_status.get("approved_model_tiers"), dict) else {}
+        research_model_tier = _research_lab_prompt_model_tier(default_tier, approved_tiers)
+    key_result = _register_research_lab_openrouter_key(wallet, status)
+    if key_result is None:
+        return
+    key_ref, key_handling = key_result
+
+    dest_coldkey = get_leadpoet_coldkey(netuid)
+    print("")
+    print(f"Top-up payment: ${additional_compute_budget_usd:.2f} USD-equivalent in TAO")
+    print(f"Payment destination coldkey for netuid {netuid}: {dest_coldkey}")
+    payment_block_hash = input("   Payment block hash: ").strip()
+    try:
+        payment_extrinsic_index = int(input("   Payment extrinsic index: ").strip())
+    except ValueError:
+        print("❌ Payment extrinsic index must be an integer.")
+        return
+    if not ticket_id or not payment_block_hash:
+        print("❌ Ticket ID and payment block hash are required.")
+        return
+
+    topup_payload = _research_lab_signed_payload(
+        wallet,
+        {
+            "miner_hotkey": wallet.hotkey.ss58_address,
+            "timestamp": int(time.time()),
+            "idempotency_key": f"research-loop-topup:{ticket_id}:{int(time.time())}",
+            "ticket_id": ticket_id,
+            "continue_from_run_id": continue_from_run_id or None,
+            "payment_block_hash": payment_block_hash,
+            "payment_extrinsic_index": payment_extrinsic_index,
+            "additional_compute_budget_usd": additional_compute_budget_usd,
+            "research_model_tier": research_model_tier,
+            "topup_reason": "promising_needs_topup",
+            "miner_openrouter_key_ref": key_ref,
+            "miner_openrouter_key_handling": key_handling,
+            "miner_openrouter_preflight_status": "passed",
+        },
+    )
+    topup_result = _post_research_lab_json("/research-lab/loop-topups", topup_payload, timeout=600)
+    if "error" in topup_result:
+        print(f"❌ Top-up failed: HTTP {topup_result.get('status_code')}")
+        print(f"   {topup_result['error']}")
+        return
+    print("✅ Research Lab top-up accepted")
+    print(f"   New run ID: {topup_result.get('run_id')}")
+    print(f"   Status: {topup_result.get('status')}")
+    print(f"   Payment ref: {topup_result.get('payment_ref')}")
 
 def main():
     parser = argparse.ArgumentParser(description="LeadPoet Miner")

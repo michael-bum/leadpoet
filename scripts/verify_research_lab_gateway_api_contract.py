@@ -17,10 +17,13 @@ from gateway.research_lab.bundles import build_shadow_report_bundle, sha256_json
 from gateway.research_lab.config import ResearchLabGatewayConfig
 from gateway.research_lab.models import (
     ResearchLabLoopStartRequest,
+    ResearchLabLoopTopUpRequest,
+    ResearchLabOpenRouterKeyRegisterRequest,
     ResearchLabReceiptCreateRequest,
     ResearchLabScoreBundleCreateRequest,
     ResearchLabTicketCreateRequest,
 )
+from gateway.research_lab.key_vault import openrouter_key_ref, validate_openrouter_key_format
 from leadpoet_verifier.research_evaluation import build_research_evaluation_score_bundle
 
 
@@ -40,9 +43,11 @@ def main() -> int:
     paths = {route.path for route in router.routes}
     for required in {
         "/research-lab/status",
+        "/research-lab/openrouter-keys",
         "/research-lab/tickets",
         "/research-lab/probes",
         "/research-lab/loop-start",
+        "/research-lab/loop-topups",
         "/research-lab/receipts",
         "/research-lab/tickets/{ticket_id}",
         "/research-lab/receipts/{receipt_id}",
@@ -61,10 +66,32 @@ def main() -> int:
         idempotency_key="ticket-idempotency-001",
         island="generalist",
         brief_sanitized_ref="brief_sanitized:sha256:abc123",
+        brief_public_summary="Improve evidence freshness scoring and reduce overbroad company matches.",
     )
     reparsed_ticket = ResearchLabTicketCreateRequest.model_validate(ticket.model_dump(mode="json"))
     if reparsed_ticket != ticket:
         errors.append("ticket request failed json round-trip")
+
+    key_registration = ResearchLabOpenRouterKeyRegisterRequest(
+        miner_hotkey=ticket.miner_hotkey,
+        signature=ticket.signature,
+        timestamp=now,
+        idempotency_key="openrouter-key-idempotency-001",
+        openrouter_api_key="sk-or-v1-" + "a" * 48,
+        key_label="research-lab-test-key",
+    )
+    reparsed_key_registration = ResearchLabOpenRouterKeyRegisterRequest.model_validate(
+        key_registration.model_dump(mode="json")
+    )
+    if reparsed_key_registration != key_registration:
+        errors.append("OpenRouter key registration request failed json round-trip")
+    try:
+        validate_openrouter_key_format(key_registration.openrouter_api_key)
+    except ValueError:
+        errors.append("valid OpenRouter key format was rejected")
+    ref = openrouter_key_ref(miner_hotkey=ticket.miner_hotkey, key_hash="a" * 64)
+    if not ref.startswith("encrypted_ref:openrouter:") or len(ref.rsplit(":", 1)[-1]) != 32:
+        errors.append("OpenRouter key ref shape is invalid")
 
     loop_start = ResearchLabLoopStartRequest(
         miner_hotkey=ticket.miner_hotkey,
@@ -77,10 +104,32 @@ def main() -> int:
         miner_openrouter_key_ref="encrypted_ref:vault:miner-openrouter-key-001",
         miner_openrouter_key_handling="encrypted_ref",
         miner_openrouter_preflight_status="passed",
+        research_model_tier="default",
+        requested_compute_budget_usd=5.0,
+        max_compute_budget_usd=25.0,
     )
     reparsed_loop_start = ResearchLabLoopStartRequest.model_validate(loop_start.model_dump(mode="json"))
     if reparsed_loop_start != loop_start:
         errors.append("loop-start request failed json round-trip")
+
+    topup = ResearchLabLoopTopUpRequest(
+        miner_hotkey=ticket.miner_hotkey,
+        signature=ticket.signature,
+        timestamp=now,
+        idempotency_key="loop-topup-idempotency-001",
+        ticket_id="11111111-1111-4111-8111-111111111111",
+        continue_from_run_id="22222222-2222-4222-8222-222222222222",
+        payment_block_hash="0x" + "33" * 32,
+        payment_extrinsic_index=5,
+        additional_compute_budget_usd=10.0,
+        research_model_tier="default",
+        miner_openrouter_key_ref="encrypted_ref:vault:miner-openrouter-key-001",
+        miner_openrouter_key_handling="encrypted_ref",
+        miner_openrouter_preflight_status="passed",
+    )
+    reparsed_topup = ResearchLabLoopTopUpRequest.model_validate(topup.model_dump(mode="json"))
+    if reparsed_topup != topup:
+        errors.append("loop-topup request failed json round-trip")
 
     receipt = ResearchLabReceiptCreateRequest(
         internal_run_ref="runner:research-loop:001",
@@ -98,6 +147,17 @@ def main() -> int:
     reparsed_receipt = ResearchLabReceiptCreateRequest.model_validate(receipt.model_dump(mode="json"))
     if reparsed_receipt != receipt:
         errors.append("receipt request failed json round-trip")
+
+    try:
+        ResearchLabTicketCreateRequest(
+            **{
+                **ticket.model_dump(),
+                "brief_public_summary": "raw_secret_should_fail",
+            }
+        )
+        errors.append("raw secret marker in ticket public summary was accepted")
+    except ValueError:
+        pass
 
     try:
         ResearchLabLoopStartRequest(

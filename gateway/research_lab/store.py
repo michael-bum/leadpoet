@@ -102,6 +102,34 @@ async def payment_ref_exists(block_hash: str, extrinsic_index: int) -> bool:
     return row is not None
 
 
+async def create_openrouter_key_ref(
+    *,
+    key_ref: str,
+    miner_hotkey: str,
+    key_hash: str,
+    encrypted_key_ciphertext: str,
+    kms_key_id: str,
+    encryption_context_hash: str,
+    preflight_doc: dict[str, Any],
+) -> dict[str, Any]:
+    existing = await select_one("research_lab_openrouter_key_refs", filters=(("key_ref", key_ref),))
+    if existing:
+        return existing
+    row = {
+        "key_ref": key_ref,
+        "schema_version": "1.0",
+        "miner_hotkey": miner_hotkey,
+        "key_hash": key_hash,
+        "encrypted_key_ciphertext": encrypted_key_ciphertext,
+        "kms_key_id": kms_key_id,
+        "encryption_context_hash": encryption_context_hash,
+        "preflight_status": "passed",
+        "preflight_doc": preflight_doc,
+    }
+    row["anchored_hash"] = canonical_hash(row)
+    return await insert_row("research_lab_openrouter_key_refs", row)
+
+
 async def create_ticket(request: Any) -> tuple[dict[str, Any], dict[str, Any]]:
     ticket_id = deterministic_uuid("ticket", request.miner_hotkey, request.idempotency_key)
     existing_ticket = await select_one("research_loop_tickets", filters=(("ticket_id", ticket_id),))
@@ -132,6 +160,11 @@ async def create_ticket(request: Any) -> tuple[dict[str, Any], dict[str, Any]]:
         "ticket_doc": {
             "idempotency_key_hash": canonical_hash(request.idempotency_key),
             "source": "gateway_research_lab_api",
+            "brief_public_summary": getattr(request, "brief_public_summary", None),
+            "research_model_tier": getattr(request, "research_model_tier", "default"),
+            "requested_compute_budget_usd": float(getattr(request, "requested_compute_budget_usd", 5.0)),
+            "max_compute_budget_usd": float(getattr(request, "max_compute_budget_usd", 25.0)),
+            "budget_policy_version": "research-lab-budget:v1",
         },
     }
     ticket_payload["ticket_hash"] = canonical_hash(ticket_payload)
@@ -249,7 +282,22 @@ async def create_loop_start_payment(
     miner_hotkey: str,
     payment_info: dict[str, Any],
     required_usd: float,
+    payment_kind: str = "loop_start",
+    run_id: str | None = None,
+    compute_budget_usd: float | None = None,
+    extra_verification_doc: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    verification_doc = {
+        "call_function": payment_info.get("call_function"),
+        "amount_rao": payment_info.get("amount_rao"),
+        "payment_kind": payment_kind,
+    }
+    if run_id:
+        verification_doc["run_id"] = run_id
+    if compute_budget_usd is not None:
+        verification_doc["compute_budget_usd"] = float(compute_budget_usd)
+    if extra_verification_doc:
+        verification_doc.update(extra_verification_doc)
     row = {
         "payment_id": str(uuid4()),
         "schema_version": "1.0",
@@ -268,10 +316,7 @@ async def create_loop_start_payment(
         "tao_price_usd": payment_info.get("tao_price_at_payment", 0.0),
         "payment_status": "verified",
         "verification_error": None,
-        "verification_doc": {
-            "call_function": payment_info.get("call_function"),
-            "amount_rao": payment_info.get("amount_rao"),
-        },
+        "verification_doc": verification_doc,
         "verified_at": now_iso(),
     }
     return await insert_row("research_loop_start_payments", row)
