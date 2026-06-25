@@ -1,8 +1,8 @@
 """Production Research Lab gateway flags.
 
-All live workflow flags default false. Enabling the API only exposes the
-Research Lab namespace; paid loops, probes, writes, receipts, and weights each
-require their own explicit gate.
+Live workflow flags default on only for the production subnet
+(`BITTENSOR_NETWORK=finney`, `BITTENSOR_NETUID=71`). Other environments stay
+closed unless explicitly enabled.
 """
 
 from __future__ import annotations
@@ -11,7 +11,7 @@ from dataclasses import dataclass
 import json
 import logging
 import os
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 TRUTHY = {"1", "true", "yes", "on"}
@@ -20,6 +20,28 @@ logger = logging.getLogger(__name__)
 # Single code-level default for the Research Lab loop-start fee. Operators can
 # still override it at runtime with RESEARCH_LAB_LOOP_START_FEE_USD.
 DEFAULT_LOOP_START_FEE_USD = 0.2
+
+
+def _is_production_subnet() -> bool:
+    network = (
+        os.getenv("BITTENSOR_NETWORK")
+        or os.getenv("SUBTENSOR_NETWORK")
+        or ""
+    ).strip().lower()
+    netuid = (
+        os.getenv("BITTENSOR_NETUID")
+        or os.getenv("NETUID")
+        or ""
+    ).strip()
+    return network == "finney" and netuid == "71"
+
+
+def _prod_default(default_for_prod: bool, default_for_non_prod: bool = False) -> str:
+    return (
+        "true"
+        if (_is_production_subnet() and default_for_prod) or (not _is_production_subnet() and default_for_non_prod)
+        else "false"
+    )
 
 
 def _truthy(name: str, default: str = "false") -> bool:
@@ -38,6 +60,16 @@ def _int(name: str, default: int) -> int:
         return int(os.getenv(name, str(default)))
     except ValueError:
         return default
+
+
+def _optional_int(name: str) -> Optional[int]:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _normalized_csv(name: str, default: str) -> tuple[str, ...]:
@@ -94,6 +126,7 @@ class ResearchLabGatewayConfig:
     hosted_worker_queue_fetch_limit: int = 20
     hosted_worker_require_proxy: bool = False
     hosted_worker_proxy_url: str = ""
+    active_loop_stale_after_seconds: int = 7200
     scoring_worker_enabled: bool = False
     scoring_worker_poll_seconds: int = 15
     scoring_worker_max_candidates: int = 1
@@ -142,6 +175,8 @@ class ResearchLabGatewayConfig:
     lab_champion_icps_per_day: int = 6
     public_benchmark_public_icps_per_day: int = 3
     public_benchmark_public_weak_per_day: int = 2
+    public_benchmark_public_total_icps: Optional[int] = None
+    public_benchmark_public_weak_total: Optional[int] = None
     improvement_threshold_points: float = 1.0
     improvement_min_delta_lcb: float = 0.0
     private_model_manifest_uri: str = (
@@ -172,6 +207,7 @@ class ResearchLabGatewayConfig:
 
     @classmethod
     def from_env(cls) -> "ResearchLabGatewayConfig":
+        prod_on = _prod_default(True)
         total_workers = max(1, _int("RESEARCH_LAB_HOSTED_WORKER_TOTAL_WORKERS", 1))
         worker_index = _int("RESEARCH_LAB_HOSTED_WORKER_INDEX", 0)
         if worker_index < 0:
@@ -185,22 +221,22 @@ class ResearchLabGatewayConfig:
         if scoring_worker_index >= scoring_total_workers:
             scoring_worker_index = scoring_worker_index % scoring_total_workers
         return cls(
-            api_enabled=_truthy("RESEARCH_LAB_GATEWAY_API_ENABLED"),
-            production_writes_enabled=_truthy("RESEARCH_LAB_PRODUCTION_WRITES_ENABLED"),
-            paid_loops_enabled=_truthy("RESEARCH_LAB_PAID_LOOPS_ENABLED"),
+            api_enabled=_truthy("RESEARCH_LAB_GATEWAY_API_ENABLED", prod_on),
+            production_writes_enabled=_truthy("RESEARCH_LAB_PRODUCTION_WRITES_ENABLED", prod_on),
+            paid_loops_enabled=_truthy("RESEARCH_LAB_PAID_LOOPS_ENABLED", prod_on),
             loop_topups_enabled=_truthy("RESEARCH_LAB_LOOP_TOPUPS_ENABLED", "false"),
-            probes_enabled=_truthy("RESEARCH_LAB_PROBES_ENABLED"),
-            hosted_runs_enabled=_truthy("RESEARCH_LAB_HOSTED_RUNS_ENABLED"),
-            receipts_enabled=_truthy("RESEARCH_LAB_RECEIPTS_ENABLED"),
-            evaluation_bundles_enabled=_truthy("RESEARCH_LAB_EVALUATION_BUNDLES_ENABLED"),
-            reports_enabled=_truthy("RESEARCH_LAB_REPORTS_ENABLED"),
-            public_activity_enabled=_truthy("RESEARCH_LAB_PUBLIC_ACTIVITY_ENABLED"),
-            shadow_bundles_enabled=_truthy("RESEARCH_LAB_SHADOW_BUNDLES_ENABLED"),
-            shadow_weights_enabled=_truthy("RESEARCH_LAB_SHADOW_WEIGHTS_ENABLED"),
+            probes_enabled=_truthy("RESEARCH_LAB_PROBES_ENABLED", prod_on),
+            hosted_runs_enabled=_truthy("RESEARCH_LAB_HOSTED_RUNS_ENABLED", prod_on),
+            receipts_enabled=_truthy("RESEARCH_LAB_RECEIPTS_ENABLED", prod_on),
+            evaluation_bundles_enabled=_truthy("RESEARCH_LAB_EVALUATION_BUNDLES_ENABLED", prod_on),
+            reports_enabled=_truthy("RESEARCH_LAB_REPORTS_ENABLED", prod_on),
+            public_activity_enabled=_truthy("RESEARCH_LAB_PUBLIC_ACTIVITY_ENABLED", prod_on),
+            shadow_bundles_enabled=_truthy("RESEARCH_LAB_SHADOW_BUNDLES_ENABLED", prod_on),
+            shadow_weights_enabled=_truthy("RESEARCH_LAB_SHADOW_WEIGHTS_ENABLED", prod_on),
             shadow_reimbursements_enabled=_truthy("RESEARCH_LAB_SHADOW_REIMBURSEMENTS_ENABLED"),
             crowning_enabled=_truthy("RESEARCH_LAB_CROWNING_ENABLED"),
-            reimbursements_enabled=_truthy("RESEARCH_LAB_REIMBURSEMENTS_ENABLED"),
-            weight_mutation_enabled=_truthy("RESEARCH_LAB_WEIGHT_MUTATION_ENABLED"),
+            reimbursements_enabled=_truthy("RESEARCH_LAB_REIMBURSEMENTS_ENABLED", prod_on),
+            weight_mutation_enabled=_truthy("RESEARCH_LAB_WEIGHT_MUTATION_ENABLED", prod_on),
             fulfillment_mutation_enabled=_truthy("RESEARCH_LAB_FULFILLMENT_MUTATION_ENABLED"),
             auto_promotion_enabled=_truthy("RESEARCH_LAB_AUTO_PROMOTION_ENABLED"),
             auto_commit_enabled=_truthy("RESEARCH_LAB_AUTO_COMMIT_ENABLED"),
@@ -222,6 +258,10 @@ class ResearchLabGatewayConfig:
                 or _truthy("RESEARCH_LAB_HOSTED_WORKER_REQUIRE_PROXY")
             ),
             hosted_worker_proxy_url=os.getenv("RESEARCH_LAB_HOSTED_WORKER_PROXY", ""),
+            active_loop_stale_after_seconds=max(
+                60,
+                _int("RESEARCH_LAB_ACTIVE_LOOP_STALE_AFTER_SECONDS", 7200),
+            ),
             scoring_worker_enabled=_truthy("RESEARCH_LAB_SCORING_WORKER_ENABLED"),
             scoring_worker_poll_seconds=max(1, _int("RESEARCH_LAB_SCORING_WORKER_POLL_SECONDS", 15)),
             scoring_worker_max_candidates=max(1, _int("RESEARCH_LAB_SCORING_WORKER_MAX_CANDIDATES", 1)),
@@ -243,7 +283,7 @@ class ResearchLabGatewayConfig:
             ),
             private_baseline_rebenchmark_enabled=_truthy(
                 "RESEARCH_LAB_PRIVATE_BASELINE_REBENCHMARK_ENABLED",
-                "false",
+                prod_on,
             ),
             auto_research_min_seconds=max(0, _int("RESEARCH_LAB_AUTO_RESEARCH_MIN_SECONDS", 600)),
             auto_research_max_seconds=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MAX_SECONDS", 1800)),
@@ -336,7 +376,7 @@ class ResearchLabGatewayConfig:
             ),
             lab_champion_threshold_points=max(0.0, _float("RESEARCH_LAB_CHAMPION_THRESHOLD_POINTS", 2.0)),
             lab_champion_eval_days=max(1, _int("RESEARCH_LAB_CHAMPION_EVAL_DAYS", 10)),
-            lab_champion_icps_per_day=max(1, _int("RESEARCH_LAB_CHAMPION_ICPS_PER_DAY", 6)),
+            lab_champion_icps_per_day=max(1, _int("RESEARCH_LAB_CHAMPION_ICPS_PER_DAY", 2)),
             public_benchmark_public_icps_per_day=max(
                 1,
                 _int("RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_ICPS_PER_DAY", 3),
@@ -344,6 +384,16 @@ class ResearchLabGatewayConfig:
             public_benchmark_public_weak_per_day=max(
                 0,
                 _int("RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_WEAK_PER_DAY", 2),
+            ),
+            public_benchmark_public_total_icps=(
+                max(1, value)
+                if (value := _optional_int("RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_TOTAL_ICPS")) is not None
+                else 10
+            ),
+            public_benchmark_public_weak_total=(
+                max(0, value)
+                if (value := _optional_int("RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_WEAK_TOTAL")) is not None
+                else 7
             ),
             improvement_threshold_points=max(
                 0.0,
@@ -506,9 +556,24 @@ class ResearchLabGatewayConfig:
             "champion_icps_per_day": self.lab_champion_icps_per_day,
             "public_benchmark_public_icps_per_day": self.public_benchmark_public_icps_per_day,
             "public_benchmark_public_weak_per_day": self.public_benchmark_public_weak_per_day,
+            "public_benchmark_public_total_icps": self.public_benchmark_public_total_icps,
+            "public_benchmark_public_weak_total": self.public_benchmark_public_weak_total,
         }
 
     def validate_public_benchmark_split(self) -> None:
+        total_icps = self.lab_champion_eval_days * self.lab_champion_icps_per_day
+        if self.public_benchmark_public_total_icps is not None:
+            if self.public_benchmark_public_total_icps >= total_icps:
+                raise ValueError("RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_TOTAL_ICPS must leave private holdout ICPs")
+            weak_total = self.public_benchmark_public_weak_total
+            if weak_total is None:
+                weak_total = self.public_benchmark_public_total_icps // 2
+            if weak_total > self.public_benchmark_public_total_icps:
+                raise ValueError(
+                    "RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_WEAK_TOTAL must be <= "
+                    "RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_TOTAL_ICPS"
+                )
+            return
         if self.public_benchmark_public_icps_per_day > self.lab_champion_icps_per_day:
             raise ValueError(
                 "RESEARCH_LAB_PUBLIC_BENCHMARK_PUBLIC_ICPS_PER_DAY must be <= "
@@ -574,6 +639,8 @@ class ResearchLabGatewayConfig:
                 "champion_icps_per_day": self.lab_champion_icps_per_day,
                 "public_benchmark_public_icps_per_day": self.public_benchmark_public_icps_per_day,
                 "public_benchmark_public_weak_per_day": self.public_benchmark_public_weak_per_day,
+                "public_benchmark_public_total_icps": self.public_benchmark_public_total_icps,
+                "public_benchmark_public_weak_total": self.public_benchmark_public_weak_total,
                 "improvement_threshold_points": self.improvement_threshold_points,
                 "improvement_min_delta_lcb": self.improvement_min_delta_lcb,
             },
