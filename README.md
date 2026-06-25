@@ -6,28 +6,28 @@
 
 <p align="center">
   <a href="https://discord.gg/tMcmbPKvz"><img alt="Discord" src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat-square"></a>
-  <a href="https://subnet71.com"><img alt="Leaderboard" src="https://img.shields.io/badge/Leaderboard-subnet71.com-d6ad5f?style=flat-square"></a>
-  <a href="https://leadpoet.com"><img alt="Website" src="https://img.shields.io/badge/Website-leadpoet.com-111827?style=flat-square"></a>
+  <a href="https://subnet71.com"><img alt="Leaderboard" src="https://img.shields.io/badge/Leaderboard-subnet71.com-e8c76d?style=flat-square"></a>
+  <a href="https://leadpoet.com"><img alt="Website" src="https://img.shields.io/badge/Website-leadpoet.com-f3f4f6?style=flat-square"></a>
   <a href="https://x.com/subnet71"><img alt="Subnet X" src="https://img.shields.io/badge/X-@subnet71-000000?style=flat-square"></a>
   <a href="https://x.com/LeadpoetAI"><img alt="Leadpoet X" src="https://img.shields.io/badge/X-@LeadpoetAI-000000?style=flat-square"></a>
   <a href="https://www.linkedin.com/company/leadpoet/"><img alt="LinkedIn" src="https://img.shields.io/badge/LinkedIn-Leadpoet-0A66C2?style=flat-square"></a>
-  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/License-MIT-2563eb?style=flat-square"></a>
 </p>
+
 
 ---
 
 Leadpoet is Bittensor Subnet 71. The subnet rewards miners for improving and operating AI systems that find high-quality sales leads.
 
-The network currently has two production tracks:
+The network has two miner tracks:
 
-- **Research Lab** - miners fund hosted auto-research loops that try to improve Leadpoet's private sourcing model.
+- **Research Lab** - miners fund hosted auto-research loops that try to improve Leadpoet's model.
 - **Fulfillment** - miners compete on real client requests by submitting enriched leads that match a specific ICP.
 
 ## Dashboard
 
 Use the public dashboard to track:
 
-- Current private-model benchmark score.
+- Current model benchmark score.
 - Public ICP benchmark examples and scores.
 - Recent Research Lab activity.
 - Fulfillment activity and leaderboard.
@@ -87,16 +87,44 @@ The miner will ask which mode to run:
 
 ### Research Lab
 
-Research Lab lets miners contribute compute toward improving Leadpoet's private sourcing model.
+Research Lab lets miners contribute compute toward improving Leadpoet's sourcing model.
 
-Current flow:
+How it works:
 
 1. The miner provides an OpenRouter key.
-2. The miner enters an optional general research focus.
+2. The miner enters a research direction.
 3. The miner pays the loop-start fee in TAO.
 4. The gateway runs the hosted auto-research loop.
 5. Candidate improvements are scored.
-6. Rewards are assigned to miners.
+6. Miners are provided with their respective rewards.
+
+Research Lab rewards have two parts:
+
+- Compute reimbursement for verified OpenRouter spend from accepted research loops.
+- Additional improvement rewards when a candidate improvement beats the current model benchmark.
+
+At a high level, rewards are calculated per reward epoch:
+
+```text
+lab_allocation = subnet_emissions * research_lab_allocation_rate
+compute_credit = verified_openrouter_spend * participation_multiplier
+improvement_credit = max(0, candidate_score - benchmark_score - improvement_threshold)
+```
+
+If there are no winning improvements, the Research Lab allocation is split across participating miners by compute credit:
+
+```text
+miner_reward = lab_allocation * miner_compute_credit / total_compute_credit
+```
+
+If there are winning improvements, verified compute reimbursement is paid first, capped by the miner's remaining verified spend. If reimbursement demand is larger than available reimbursement capacity, reimbursements are prorated by compute credit. If reimbursement demand is smaller than available capacity, the unused amount flows to winning improvements.
+
+```text
+reimbursement_reward = min(remaining_verified_spend, reimbursement_capacity * miner_compute_credit / total_compute_credit)
+winner_reward = remaining_lab_allocation * winner_improvement_credit / total_winner_improvement_credit
+```
+
+The reward records tie miner hotkeys to the run, candidate, verified spend, benchmark result, and validator weight input. More information can be found through investigating the relevant code in the neurons/validator.py.
 
 ### Fulfillment
 
@@ -178,17 +206,22 @@ See [`env.example`](env.example) for a fuller configuration template.
 
 ## Rewards
 
-The active production split is designed around both Research Lab and Fulfillment:
+Rewards are designed around both Research Lab and Fulfillment:
 
-- Research Lab has its own allocation for compute reimbursement and successful model improvements.
+- Research Lab miners can earn reimbursement-style emissions for verified compute they provide.
+- Research Lab miners that produce benchmarked model improvements can earn larger improvement rewards.
 - Fulfillment rewards winning leads from client requests.
 - The weekly leaderboard rewards top fulfillment performance.
 
-Exact weights are computed by the validator from signed gateway bundles and current subnet policy.
+Exact weights are computed by validators from signed gateway bundles, verified compute records, benchmark results, allocation records, and current subnet policy. Research Lab reward calculations can be independently checked from the emitted receipts, signed audit logs, and Arweave-anchored checkpoints.
 
 ## Transparency
 
-Leadpoet uses signed gateway artifacts and validator-side verification for Research Lab and Fulfillment outputs.
+Leadpoet uses a gateway TEE, signed gateway artifacts, validator-side verification, and Arweave checkpoints for Research Lab and Fulfillment outputs.
+
+The subnet is designed to be externally auditable without exposing model code, hidden ICPs, provider secrets, or candidate patch internals. The gateway emits signed receipts, scoring bundles, allocation records, and compact audit anchors from inside the TEE. Validators verify those artifacts before using them for weights.
+
+Arweave checkpoints anchor the hashes and status transitions used in the reward calculation. An external auditor can match the Arweave checkpoint data to the signed gateway artifacts, recompute the reward inputs, and verify that validator weights follow the published policy.
 
 Useful tools:
 

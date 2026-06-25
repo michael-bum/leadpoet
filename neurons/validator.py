@@ -411,6 +411,23 @@ def _research_lab_allocation_has_live_payments(allocation_doc: Any) -> bool:
     return False
 
 
+def _research_lab_allocation_is_reimbursement_only(allocation_doc: Any) -> bool:
+    if not isinstance(allocation_doc, dict):
+        return False
+    reimbursement_rows = allocation_doc.get("reimbursement_allocations") or []
+    if not any(
+        float(row.get("paid_alpha_percent") or 0.0) > 0
+        for row in reimbursement_rows
+        if isinstance(row, dict)
+    ):
+        return False
+    for section in ("champion_allocations", "queued_champion_allocations"):
+        rows = allocation_doc.get(section) or []
+        if any(float(row.get("paid_alpha_percent") or 0.0) > 0 for row in rows if isinstance(row, dict)):
+            return False
+    return True
+
+
 def _research_lab_uid_weights_from_allocation(
     allocation_doc: Any,
     *,
@@ -3402,7 +3419,7 @@ class Validator(BaseValidatorNeuron):
             print(f"   ✅ Research Lab shadow bundle verified: {verification.get('weight_vector_hash')}")
             allocation_component = None
             allocation_verification = None
-            if flags.weight_mutation_enabled or flags.submit_on_chain_enabled:
+            if flags.live_allocation_enabled():
                 print(f"   Fetching Research Lab live allocation for epoch {current_epoch}")
                 allocation_bundle = await asyncio.to_thread(fetch_research_lab_allocation_bundle, gateway_url, current_epoch)
                 allocation_verification = verify_research_lab_allocation_bundle(allocation_bundle, flags=flags)
@@ -3448,7 +3465,20 @@ class Validator(BaseValidatorNeuron):
                 print(f"   Research Lab evaluation artifact written: {eval_artifact_path}")
                 if not evaluation_verification.get("passed"):
                     print(f"   ⚠️ Research Lab evaluation verification failed: {evaluation_verification.get('errors')}")
-                    if (
+                    reimbursement_only = _research_lab_allocation_is_reimbursement_only(
+                        allocation_component.get("allocation_doc", {})
+                        if isinstance(allocation_component, dict)
+                        else {}
+                    )
+                    only_missing_bundles = set(evaluation_verification.get("errors") or []) == {
+                        "no_verified_evaluation_score_bundles"
+                    }
+                    if reimbursement_only and only_missing_bundles:
+                        print(
+                            "   ⚠️ No scored evaluation bundles yet; proceeding because "
+                            "the live Research Lab allocation is reimbursement-only"
+                        )
+                    elif (
                         flags.weight_mutation_enabled
                         or flags.submit_on_chain_enabled
                         or flags.require_evaluation_verification_before_submit
@@ -3561,7 +3591,13 @@ class Validator(BaseValidatorNeuron):
             # submit weights rather than misrouting emissions.
             BURN_TARGET_UID = int(os.environ.get("BURN_TARGET_UID", "0"))
             EXPECTED_BURN_TARGET_HOTKEY = os.environ.get("EXPECTED_BURN_TARGET_HOTKEY")
-            if not EXPECTED_BURN_TARGET_HOTKEY and os.environ.get("BITTENSOR_NETWORK", "finney") != "test":
+            subtensor_config = getattr(self.config, "subtensor", None)
+            configured_network = str(
+                os.environ.get("BITTENSOR_NETWORK")
+                or getattr(subtensor_config, "network", "")
+                or "finney"
+            ).strip().lower()
+            if not EXPECTED_BURN_TARGET_HOTKEY and configured_network != "test":
                 EXPECTED_BURN_TARGET_HOTKEY = "5FNVgRnrxMibhcBGEAaajGrYjsaCn441a5HuGUBUNnxEBLo9"
 
             # Read ff_enabled EARLY (used by the no-sourcing-data gates below)

@@ -20,6 +20,8 @@ from gateway.research_lab.loop_engine import (  # noqa: E402
     AutoResearchLoopSettings,
     OpenRouterCallResult,
 )
+from gateway.research_lab.store import canonical_hash, scoring_dispatch_event_anchor_payload  # noqa: E402
+from gateway.research_lab.scoring_worker import _private_benchmark_row_is_valid  # noqa: E402
 from gateway.research_lab.worker import (  # noqa: E402
     HostedResearchLabWorkerError,
     ResearchLabHostedWorker,
@@ -97,6 +99,40 @@ def main() -> int:
     if "source_router" in registry.by_name():
         errors.append("runtime-incompatible source_router strategy component was exposed to auto-research")
 
+    dispatch_payload = {
+        "dispatch_type": "private_baseline_rebenchmark",
+        "dispatch_status": "failed",
+        "candidate_id": None,
+        "run_id": None,
+        "ticket_id": None,
+        "rolling_window_hash": "sha256:" + "d" * 64,
+        "score_bundle_id": None,
+        "benchmark_bundle_id": None,
+        "worker_ref": "research-lab-scorer-1",
+        "proxy_ref_hash": "sha256:" + "e" * 64,
+        "event_doc": {"error": "same failure"},
+    }
+    first_hash = canonical_hash(scoring_dispatch_event_anchor_payload(dispatch_payload, "11111111-1111-4111-8111-111111111111"))
+    second_hash = canonical_hash(scoring_dispatch_event_anchor_payload(dispatch_payload, "22222222-2222-4222-8222-222222222222"))
+    if first_hash == second_hash:
+        errors.append("scoring dispatch event anchored_hash still collides for repeated events")
+    if _private_benchmark_row_is_valid(
+        {
+            "current_benchmark_status": "completed",
+            "benchmark_quality": "passed",
+            "score_summary_doc": {"per_icp_summaries": [{"company_count": 0}, {"company_count": 0}]},
+        }
+    ):
+        errors.append("all-empty private baseline benchmark row was treated as valid")
+    if not _private_benchmark_row_is_valid(
+        {
+            "current_benchmark_status": "completed",
+            "benchmark_quality": "passed",
+            "score_summary_doc": {"per_icp_summaries": [{"company_count": 0}, {"company_count": 1}]},
+        }
+    ):
+        errors.append("nonempty private baseline benchmark row was treated as invalid")
+
     try:
         parse_auto_research_response('{"candidates":[{"hypothesis":{},"patch":{"patch_type":"CODE_EDIT","patch_doc":{}}}]}')
         errors.append("parser accepted CODE_EDIT candidate")
@@ -122,6 +158,17 @@ def main() -> int:
         errors.append("auto-research prompt did not guard against client-specific overfitting")
     if "HTTPS_PROXY" not in DEFAULT_ENV_PASSTHROUGH or "HTTP_PROXY" not in DEFAULT_ENV_PASSTHROUGH:
         errors.append("private Docker runner does not pass through proxy env vars")
+    worker_text = (ROOT / "gateway" / "research_lab" / "worker.py").read_text(encoding="utf-8")
+    scoring_worker_text = (ROOT / "gateway" / "research_lab" / "scoring_worker.py").read_text(encoding="utf-8")
+    local_proxy_text = (ROOT / "qualification" / "validator" / "local_proxy.py").read_text(encoding="utf-8")
+    if '"data_collection": "deny"' not in worker_text or '"zdr": True' not in worker_text:
+        errors.append("hosted worker OpenRouter calls must enforce data_collection=deny and ZDR")
+    if '"data_collection": "deny"' not in local_proxy_text or '"zdr": True' not in local_proxy_text:
+        errors.append("local proxy must inject OpenRouter data_collection=deny and ZDR")
+    if "_maybe_rebase_stale_candidate_before_scoring" not in scoring_worker_text:
+        errors.append("scoring worker must rebase stale-parent candidates before evaluation")
+    if "private_model_manifest_hash\", artifact.manifest_hash" not in scoring_worker_text:
+        errors.append("private baseline lookup must filter by active private model manifest hash")
 
     eval_bundle = _score_bundle()
     page = {

@@ -12,6 +12,7 @@ import base64
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 from typing import Any, Mapping, Sequence
@@ -28,6 +29,7 @@ SECRET_MARKERS = (
     "raw_secret",
     "service_role",
 )
+PROVIDER_ERROR_MARKER = "research_lab_private_runtime_provider_error"
 DEFAULT_ENV_PASSTHROUGH = (
     "EXA_API_KEY",
     "SCRAPINGDOG_API_KEY",
@@ -46,6 +48,85 @@ DEFAULT_ENV_PASSTHROUGH = (
 
 class PrivateModelRuntimeError(RuntimeError):
     """Raised when the private model artifact cannot be executed safely."""
+
+
+def canonicalize_private_model_icp(icp: Mapping[str, Any]) -> dict[str, Any]:
+    """Adapt Research Lab ICPs to the private sourcing-model contract.
+
+    The private sourcing model is intentionally kept outside this public repo,
+    but its stable adapter expects a canonical ICP shape with
+    ``required_attribute``, ``intent_signal``, ``intent_category``,
+    ``geography``, and ``employee_count``. Research Lab benchmark rows already
+    contain the same information, but may use public qualification-era names
+    such as ``product_service``, ``intent_signals``, ``target_geography``, or
+    ``company_size``. Normalize only at the execution boundary so benchmark
+    hashes and persisted private ICP rows remain unchanged.
+    """
+    if not isinstance(icp, Mapping):
+        raise PrivateModelRuntimeError("private model ICP payload must be an object")
+    normalized = dict(icp)
+
+    industry = _first_text(normalized.get("industry"), normalized.get("market"))
+    sub_industry = _first_text(normalized.get("sub_industry"), normalized.get("subindustry"))
+    product_service = _first_text(
+        normalized.get("product_service"),
+        normalized.get("required_attribute"),
+        normalized.get("solution"),
+        normalized.get("offering"),
+    )
+    geography = _first_text(
+        normalized.get("geography"),
+        normalized.get("country"),
+        normalized.get("target_geography"),
+        normalized.get("hq_country"),
+        default="United States",
+    )
+    employee_count = _first_text(
+        normalized.get("employee_count"),
+        normalized.get("company_size"),
+        normalized.get("company_size_bucket"),
+        normalized.get("employee_range"),
+        default="50-200",
+    )
+    intent_signal = _intent_signal_text(normalized)
+    required_attribute = _required_attribute(
+        normalized.get("required_attribute"),
+        industry=industry,
+        sub_industry=sub_industry,
+        product_service=product_service,
+    )
+
+    normalized["industry"] = industry
+    normalized["sub_industry"] = sub_industry
+    normalized["geography"] = geography
+    normalized["country"] = _first_text(normalized.get("country"), geography)
+    normalized["employee_count"] = employee_count
+    normalized["product_service"] = product_service or required_attribute
+    normalized["required_attribute"] = required_attribute
+    normalized["intent_signal"] = intent_signal
+    normalized["intent_signal_text"] = _first_text(normalized.get("intent_signal_text"), intent_signal)
+    normalized["intent_signals"] = _intent_signals_list(normalized.get("intent_signals"), intent_signal)
+    normalized["intent_category"] = _intent_category(normalized.get("intent_category"), intent_signal)
+    normalized["intent_max_age_days"] = _positive_int(normalized.get("intent_max_age_days"), default=365)
+    normalized["company_stage"] = _first_text(normalized.get("company_stage"), default="Any")
+    normalized["prompt"] = _first_text(normalized.get("prompt"), _prompt_from_icp(normalized))
+    normalized["target_roles"] = normalized.get("target_roles") if isinstance(normalized.get("target_roles"), list) else []
+    normalized["target_seniority"] = _first_text(normalized.get("target_seniority"))
+    if not _first_text(normalized.get("icp_id")):
+        normalized["icp_id"] = sha256_json(
+            {
+                "industry": industry,
+                "sub_industry": sub_industry,
+                "geography": geography,
+                "employee_count": employee_count,
+                "product_service": normalized["product_service"],
+                "intent_signal": intent_signal,
+            }
+        )[:18]
+
+    if not normalized["industry"] or not normalized["intent_signal"]:
+        raise PrivateModelRuntimeError("private model ICP is missing industry or intent signal after canonicalization")
+    return normalized
 
 
 def ensure_private_model_outputs(
@@ -99,7 +180,7 @@ class SubprocessPrivateModelRunner:
             raise PrivateModelRuntimeError(f"private model source path does not exist: {self.spec.source_path}")
 
     def __call__(self, icp: Mapping[str, Any], context: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
-        payload = {"icp": dict(icp), "context": _redacted_context(context)}
+        payload = {"icp": canonicalize_private_model_icp(icp), "context": _redacted_context(context)}
         env = _build_subprocess_env(self.spec)
         command = [
             self.spec.python_executable,
@@ -127,9 +208,14 @@ class SubprocessPrivateModelRunner:
             raise PrivateModelRuntimeError(f"private model adapter failed with code {completed.returncode}: {stderr}")
 
         try:
-            decoded = json.loads(completed.stdout)
+            decoded = _loads_adapter_stdout(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise PrivateModelRuntimeError("private model adapter returned invalid JSON") from exc
+            stdout = _sanitize_text(completed.stdout)[-800:]
+            stderr = _sanitize_text(completed.stderr)[-800:]
+            raise PrivateModelRuntimeError(
+                f"private model adapter returned invalid JSON: stdout={stdout!r} stderr={stderr!r}"
+            ) from exc
+        _raise_on_empty_provider_error(decoded, completed.stderr, context_label="private model")
         return ensure_private_model_outputs(
             decoded,
             context_label="private model",
@@ -204,7 +290,7 @@ class DockerPrivateModelRunner:
             self._pull_image()
 
     def __call__(self, icp: Mapping[str, Any], context: Mapping[str, Any]) -> Sequence[Mapping[str, Any]]:
-        payload = {"icp": dict(icp), "context": _redacted_context(context)}
+        payload = {"icp": canonicalize_private_model_icp(icp), "context": _redacted_context(context)}
         decoded = self._run_json(
             bootstrap=_DOCKER_ADAPTER_BOOTSTRAP,
             argv=(self.spec.module_name, self.spec.callable_name),
@@ -276,9 +362,15 @@ class DockerPrivateModelRunner:
             stderr = _sanitize_text(completed.stderr)[-1200:]
             raise PrivateModelRuntimeError(f"docker private model adapter failed with code {completed.returncode}: {stderr}")
         try:
-            return json.loads(completed.stdout)
+            decoded = _loads_adapter_stdout(completed.stdout)
         except json.JSONDecodeError as exc:
-            raise PrivateModelRuntimeError("docker private model adapter returned invalid JSON") from exc
+            stdout = _sanitize_text(completed.stdout)[-800:]
+            stderr = _sanitize_text(completed.stderr)[-800:]
+            raise PrivateModelRuntimeError(
+                f"docker private model adapter returned invalid JSON: stdout={stdout!r} stderr={stderr!r}"
+            ) from exc
+        _raise_on_empty_provider_error(decoded, completed.stderr, context_label="docker private model")
+        return decoded
 
 
 def load_private_artifact_manifest(uri: str) -> dict[str, Any]:
@@ -439,6 +531,158 @@ def _redacted_context(context: Mapping[str, Any]) -> dict[str, Any]:
     return dict(context)
 
 
+def _raise_on_empty_provider_error(decoded: Any, stderr: str, *, context_label: str) -> None:
+    if decoded != []:
+        return
+    sanitized = _sanitize_text(stderr)
+    if PROVIDER_ERROR_MARKER not in sanitized:
+        return
+    raise PrivateModelRuntimeError(
+        f"{context_label} provider-backed sourcing failed before returning companies: "
+        f"{sanitized[-1200:]}"
+    )
+
+
+def _loads_adapter_stdout(stdout: str) -> Any:
+    try:
+        return json.loads(stdout)
+    except json.JSONDecodeError:
+        pass
+
+    for line in reversed(stdout.splitlines()):
+        candidate = line.strip()
+        if not candidate or candidate[0] not in "[{":
+            continue
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    raise json.JSONDecodeError("adapter stdout did not contain a JSON payload", stdout, 0)
+
+
+def _first_text(*values: Any, default: str = "") -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            nested = _first_text(*value)
+            if nested:
+                return nested
+            continue
+        if isinstance(value, Mapping):
+            nested = _first_text(
+                value.get("description"),
+                value.get("signal"),
+                value.get("text"),
+                value.get("label"),
+                value.get("name"),
+                value.get("value"),
+            )
+            if nested:
+                return nested
+            continue
+        text = " ".join(str(value).strip().split())
+        if text:
+            return text
+    return default
+
+
+def _intent_signal_text(icp: Mapping[str, Any]) -> str:
+    return _first_text(
+        icp.get("intent_signal_text"),
+        icp.get("intent_signal"),
+        icp.get("intent"),
+        icp.get("buying_intent"),
+        icp.get("intent_signals"),
+    )
+
+
+def _intent_signals_list(value: Any, fallback: str) -> list[str]:
+    if isinstance(value, str):
+        signals = [_first_text(value)]
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        signals = [_first_text(item) for item in value]
+    else:
+        signals = []
+    signals = [signal for signal in signals if signal]
+    if not signals and fallback:
+        signals = [fallback]
+    return signals
+
+
+def _required_attribute(
+    value: Any,
+    *,
+    industry: str,
+    sub_industry: str,
+    product_service: str,
+) -> str:
+    existing = _first_text(value)
+    if existing:
+        return existing
+    if product_service:
+        return f"The company offers or provides {product_service}"
+    if sub_industry:
+        return f"The company operates in {sub_industry}"
+    if industry:
+        return f"The company operates in {industry}"
+    return "The company matches the target customer profile"
+
+
+def _intent_category(value: Any, signal: str) -> str:
+    explicit = _first_text(value).strip().upper().replace(" ", "_").replace("-", "_")
+    if explicit:
+        return explicit
+    text = signal.lower()
+    if any(word in text for word in ("hiring", "job", "role", "career", "recruit")):
+        return "HIRING"
+    if any(word in text for word in ("tech stack", "installed", "uses ", "using ", "software", "tool")):
+        return "TECHSTACK"
+    if any(word in text for word in ("linkedin", "posted", "social", "tweet", "x.com")):
+        return "SOCIAL_POSTING"
+    if any(word in text for word in ("funding", "raised", "series ", "seed round", "financing")):
+        return "FUNDING"
+    if any(word in text for word in ("acquired", "acquisition", "merger", "bought")):
+        return "ACQUISITION"
+    if any(word in text for word in ("partner", "partnership", "integration")):
+        return "PARTNERSHIP"
+    if any(word in text for word in ("launch", "launched", "announced", "released", "new product")):
+        return "PRODUCT_LAUNCH"
+    if any(word in text for word in ("executive", "ceo", "cfo", "cto", "appointed", "joined")):
+        return "LEADERSHIP_CHANGE"
+    if any(word in text for word in ("expanded", "expansion", "new market", "opened")):
+        return "MARKET_EXPANSION"
+    if any(word in text for word in ("regulatory", "clearance", "certification", "approved")):
+        return "REGULATORY_CLEARANCE"
+    if any(word in text for word in ("factory", "facility", "store", "warehouse", "office opening")):
+        return "FACILITY_OPENING"
+    return "SALES_GROWTH"
+
+
+def _positive_int(value: Any, *, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _prompt_from_icp(icp: Mapping[str, Any]) -> str:
+    return " ".join(
+        part
+        for part in (
+            f"{icp.get('industry', '')} companies",
+            f"in {icp.get('geography', '')}" if icp.get("geography") else "",
+            f"with {icp.get('employee_count', '')} employees" if icp.get("employee_count") else "",
+            f"that {str(icp.get('required_attribute', '')).removeprefix('The company ').strip()}"
+            if icp.get("required_attribute")
+            else "",
+            f"showing intent: {icp.get('intent_signal', '')}" if icp.get("intent_signal") else "",
+        )
+        if part
+    )
+
+
 def _excluded_source_path(rel: str) -> bool:
     parts = rel.split("/")
     if any(part in {".git", "__pycache__", ".pytest_cache", ".mypy_cache", ".venv", "venv"} for part in parts):
@@ -463,8 +707,21 @@ def _contains_secret_material(value: Any) -> bool:
 
 def _sanitize_text(text: str) -> str:
     sanitized = text or ""
+    for env_name in (
+        "EXA_API_KEY",
+        "SCRAPINGDOG_API_KEY",
+        "QUALIFICATION_SCRAPINGDOG_API_KEY",
+        "OPENROUTER_API_KEY",
+        "QUALIFICATION_OPENROUTER_API_KEY",
+        "OPENROUTER_KEY",
+    ):
+        value = os.environ.get(env_name)
+        if value:
+            sanitized = sanitized.replace(value, "[REDACTED]")
     for marker in SECRET_MARKERS:
         sanitized = sanitized.replace(marker, "[REDACTED]")
+    sanitized = re.sub(r"(?i)(api_key=)[^&\s]+", r"\1[REDACTED]", sanitized)
+    sanitized = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s]+", r"\1[REDACTED]", sanitized)
     return sanitized
 
 
@@ -478,7 +735,69 @@ def _parse_s3_uri(uri: str) -> tuple[str, str]:
     return bucket, key
 
 
-_ADAPTER_BOOTSTRAP = r"""
+_PROVIDER_DIAGNOSTICS_BOOTSTRAP = r"""
+import os
+import re
+import sys
+import urllib.request
+
+_research_lab_original_urlopen = urllib.request.urlopen
+
+def _research_lab_sanitize(text):
+    text = str(text or "")
+    for env_name in (
+        "EXA_API_KEY",
+        "SCRAPINGDOG_API_KEY",
+        "QUALIFICATION_SCRAPINGDOG_API_KEY",
+        "OPENROUTER_API_KEY",
+        "QUALIFICATION_OPENROUTER_API_KEY",
+        "OPENROUTER_KEY",
+    ):
+        value = os.environ.get(env_name)
+        if value:
+            text = text.replace(value, "[REDACTED]")
+    text = re.sub(r"(?i)(api_key=)[^&\s]+", r"\1[REDACTED]", text)
+    text = re.sub(r"(?i)(authorization:\s*bearer\s+)[^\s]+", r"\1[REDACTED]", text)
+    return text
+
+def _research_lab_urlopen(req, *args, **kwargs):
+    try:
+        return _research_lab_original_urlopen(req, *args, **kwargs)
+    except Exception as exc:
+        target = getattr(req, "full_url", req if isinstance(req, str) else "")
+        message = _research_lab_sanitize(f"{type(exc).__name__}: {exc}; url={target}")
+        sys.stderr.write("research_lab_private_runtime_provider_error " + message[-900:] + "\n")
+        raise
+
+urllib.request.urlopen = _research_lab_urlopen
+
+def _research_lab_patch_strict_qualify(adapter_module):
+    try:
+        import asyncio
+        import sourcing_model
+        import sourcing_model.core as core
+    except Exception:
+        return
+
+    def _strict_qualify(icp):
+        if not isinstance(icp, dict) or not (icp.get("industry") or icp.get("intent_signal_text") or icp.get("intent_signal")):
+            return []
+        if not (core._exa_key() and core._sd_key() and core._or_key()):
+            raise RuntimeError("Missing API keys for private sourcing model")
+        return asyncio.run(core._qualify_async(icp))
+
+    try:
+        sourcing_model.qualify = _strict_qualify
+        if hasattr(adapter_module, "qualify"):
+            adapter_module.qualify = _strict_qualify
+    except Exception as exc:
+        message = _research_lab_sanitize(f"{type(exc).__name__}: {exc}")
+        sys.stderr.write("research_lab_private_runtime_diagnostic_warning strict_qualify_patch_failed " + message[-500:] + "\n")
+"""
+
+
+_ADAPTER_BOOTSTRAP = _PROVIDER_DIAGNOSTICS_BOOTSTRAP + r"""
+import contextlib
 import importlib
 import json
 import sys
@@ -487,9 +806,11 @@ source_path, module_name, callable_name = sys.argv[1:4]
 sys.path.insert(0, source_path)
 payload = json.load(sys.stdin)
 module = importlib.import_module(module_name)
+_research_lab_patch_strict_qualify(module)
 fn = getattr(module, callable_name)
-result = fn(payload["icp"], payload.get("context") or {})
-print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+with contextlib.redirect_stdout(sys.stderr):
+    result = fn(payload["icp"], payload.get("context") or {})
+sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")))
 """
 
 
@@ -507,7 +828,8 @@ print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 """
 
 
-_DOCKER_ADAPTER_BOOTSTRAP = r"""
+_DOCKER_ADAPTER_BOOTSTRAP = _PROVIDER_DIAGNOSTICS_BOOTSTRAP + r"""
+import contextlib
 import importlib
 import json
 import sys
@@ -515,9 +837,11 @@ import sys
 module_name, callable_name = sys.argv[1:3]
 payload = json.load(sys.stdin)
 module = importlib.import_module(module_name)
+_research_lab_patch_strict_qualify(module)
 fn = getattr(module, callable_name)
-result = fn(payload["icp"], payload.get("context") or {})
-print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+with contextlib.redirect_stdout(sys.stderr):
+    result = fn(payload["icp"], payload.get("context") or {})
+sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")))
 """
 
 

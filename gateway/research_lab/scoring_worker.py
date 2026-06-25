@@ -18,7 +18,11 @@ from gateway.research_lab.icp_window import (
 )
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block
 from gateway.research_lab.models import ResearchLabScoreBundleCreateRequest
-from gateway.research_lab.promotion import ResearchLabPromotionController, load_active_private_model
+from gateway.research_lab.promotion import (
+    ResearchLabPromotionController,
+    _rebased_candidate_request,
+    load_active_private_model,
+)
 from gateway.research_lab.public_activity import safe_project_public_loop_activity
 from gateway.research_lab.public_benchmarks import (
     build_benchmark_visibility_split,
@@ -27,7 +31,9 @@ from gateway.research_lab.public_benchmarks import (
 )
 from gateway.research_lab.store import (
     canonical_hash,
+    create_candidate_artifact,
     create_candidate_evaluation_event,
+    create_candidate_promotion_event,
     create_private_model_benchmark_bundle,
     create_private_model_benchmark_event,
     create_public_benchmark_report,
@@ -55,6 +61,8 @@ from research_lab.eval.evaluator import QualificationStyleCompanyScorer
 
 
 logger = logging.getLogger(__name__)
+PRIVATE_BASELINE_FAST_EMPTY_ABORT_AFTER = 6
+PRIVATE_BASELINE_FAST_EMPTY_ABORT_SECONDS = 90.0
 
 
 def _idle_log_seconds() -> float:
@@ -246,6 +254,36 @@ class ResearchLabGatewayScoringWorker:
         start = time.time()
         try:
             evaluation_epoch = await self._resolve_evaluation_epoch()
+            stale_result = await self._maybe_rebase_stale_candidate_before_scoring(
+                candidate,
+                evaluation_epoch=evaluation_epoch,
+                elapsed_seconds=lambda: round(time.time() - start, 3),
+            )
+            if stale_result.get("status") in {"stale_parent_rebased_candidate_queued", "stale_parent_rebase_failed"}:
+                await self._maybe_finalize_candidate_receipt(candidate)
+                await safe_project_public_loop_activity(
+                    str(candidate["ticket_id"]),
+                    source_ref=f"candidate_stale_parent_rebased:{candidate_id}",
+                    reason=str(stale_result["status"]),
+                    config=self.config,
+                )
+                try:
+                    await self._write_audit_bundle(evaluation_epoch)
+                except Exception:
+                    logger.exception("Research Lab audit bundle write failed after stale-parent rebase")
+                logger.info(
+                    format_worker_block(
+                        "RESEARCH LAB CANDIDATE STALE PARENT HANDLED",
+                        (
+                            ("Worker", self.worker_ref),
+                            ("Candidate", compact_ref(candidate_id)),
+                            ("Status", stale_result.get("status")),
+                            ("Derived", compact_ref(stale_result.get("derived_candidate_id"))),
+                            ("Elapsed", f"{time.time() - start:.1f}s"),
+                        ),
+                    )
+                )
+                return
             await create_scoring_dispatch_event(
                 dispatch_type="candidate_scoring",
                 dispatch_status="assigned",
@@ -471,6 +509,120 @@ class ResearchLabGatewayScoringWorker:
             active_component_registry=active_registry,
         )
 
+    async def _maybe_rebase_stale_candidate_before_scoring(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        evaluation_epoch: int,
+        elapsed_seconds: Any,
+    ) -> dict[str, Any]:
+        active = await load_active_private_model(self.config, register_bootstrap=True)
+        active_parent = active.artifact.model_artifact_hash
+        candidate_parent = str(candidate.get("parent_artifact_hash") or "")
+        if candidate_parent == active_parent:
+            return {"status": "current_parent"}
+
+        candidate_id = str(candidate["candidate_id"])
+        base_event_doc = {
+            "action": "rebase_queued_candidate_against_active_model_before_scoring",
+            "active_parent_artifact_hash": active_parent,
+            "candidate_parent_artifact_hash": candidate_parent,
+            "evaluation_epoch": int(evaluation_epoch),
+            "worker_ref": self.worker_ref,
+            "proxy_ref_hash": self.proxy_ref_hash,
+        }
+        await create_candidate_promotion_event(
+            candidate_id=candidate_id,
+            event_type="stale_parent_detected",
+            promotion_status="rebase_required",
+            active_parent_artifact_hash=active_parent,
+            candidate_parent_artifact_hash=candidate_parent,
+            worker_ref=self.worker_ref,
+            event_doc={**base_event_doc, "stage": "before_scoring"},
+        )
+        try:
+            active_runner = DockerPrivateModelRunner(
+                DockerPrivateModelSpec(
+                    image_digest=active.artifact.image_digest,
+                    timeout_seconds=self.config.scoring_worker_model_timeout_seconds,
+                    extra_env=self._private_scoring_env(),
+                )
+            )
+            active_registry = coerce_component_registry(active_runner.metadata())
+            request = _rebased_candidate_request(candidate, active.artifact, active_registry)
+            derived_row, _event = await create_candidate_artifact(request)
+        except Exception as exc:
+            await create_candidate_evaluation_event(
+                candidate_id=candidate_id,
+                run_id=str(candidate["run_id"]),
+                ticket_id=str(candidate["ticket_id"]),
+                event_type="failed",
+                candidate_status="failed",
+                evaluator_ref=self.worker_ref,
+                reason="stale_parent_rebase_failed_before_scoring",
+                event_doc={**base_event_doc, "error": str(exc)[:500], "elapsed_seconds": elapsed_seconds()},
+            )
+            await create_scoring_dispatch_event(
+                dispatch_type="candidate_scoring",
+                dispatch_status="failed",
+                worker_ref=self.worker_ref,
+                proxy_ref_hash=self.proxy_ref_hash,
+                candidate_id=candidate_id,
+                run_id=str(candidate["run_id"]),
+                ticket_id=str(candidate["ticket_id"]),
+                event_doc={**base_event_doc, "error": str(exc)[:500]},
+            )
+            logger.exception("Research Lab stale-parent rebase failed before scoring candidate %s", candidate_id)
+            return {"status": "stale_parent_rebase_failed", "error": str(exc)[:200]}
+
+        await create_candidate_promotion_event(
+            candidate_id=candidate_id,
+            derived_candidate_id=str(derived_row["candidate_id"]),
+            event_type="rebase_queued",
+            promotion_status="rebenchmarking",
+            active_parent_artifact_hash=active_parent,
+            candidate_parent_artifact_hash=candidate_parent,
+            worker_ref=self.worker_ref,
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": str(derived_row["candidate_id"]),
+                "derived_candidate_artifact_hash": str(derived_row["candidate_artifact_hash"]),
+                "derived_parent_artifact_hash": active_parent,
+            },
+        )
+        await create_candidate_evaluation_event(
+            candidate_id=candidate_id,
+            run_id=str(candidate["run_id"]),
+            ticket_id=str(candidate["ticket_id"]),
+            event_type="rejected",
+            candidate_status="rejected",
+            evaluator_ref=self.worker_ref,
+            reason="stale_parent_rebased_before_scoring",
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": str(derived_row["candidate_id"]),
+                "elapsed_seconds": elapsed_seconds(),
+            },
+        )
+        await create_scoring_dispatch_event(
+            dispatch_type="candidate_scoring",
+            dispatch_status="rejected",
+            worker_ref=self.worker_ref,
+            proxy_ref_hash=self.proxy_ref_hash,
+            candidate_id=candidate_id,
+            run_id=str(candidate["run_id"]),
+            ticket_id=str(candidate["ticket_id"]),
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": str(derived_row["candidate_id"]),
+                "reason": "stale_parent_rebased_before_scoring",
+            },
+        )
+        return {
+            "status": "stale_parent_rebased_candidate_queued",
+            "derived_candidate_id": str(derived_row["candidate_id"]),
+        }
+
     async def _maybe_run_private_baseline(self) -> dict[str, Any] | None:
         today = datetime.now(timezone.utc).date().isoformat()
         start = time.time()
@@ -495,16 +647,22 @@ class ResearchLabGatewayScoringWorker:
             icps_per_day=self.config.lab_champion_icps_per_day,
             allow_partial=self.config.scoring_worker_allow_partial_icp_window,
         )
+        active = await load_active_private_model(self.config, register_bootstrap=True)
+        artifact = active.artifact
         existing = await select_many(
             "research_lab_private_model_benchmark_current",
             columns="*",
-            filters=(("benchmark_date", today), ("rolling_window_hash", window.window_hash)),
+            filters=(
+                ("benchmark_date", today),
+                ("rolling_window_hash", window.window_hash),
+                ("private_model_manifest_hash", artifact.manifest_hash),
+            ),
             order_by=(("created_at", True),),
             limit=25,
         )
         valid_existing = [row for row in existing if _private_benchmark_row_is_valid(row)]
         if valid_existing:
-            already_key = f"{today}:{window.window_hash}"
+            already_key = f"{today}:{window.window_hash}:{artifact.manifest_hash}"
             if self._baseline_already_logged_date != already_key:
                 logger.info(
                     format_worker_block(
@@ -513,6 +671,7 @@ class ResearchLabGatewayScoringWorker:
                             ("Worker", self.worker_ref),
                             ("Benchmark date", today),
                             ("Rolling window", compact_ref(window.window_hash)),
+                            ("Private model", compact_ref(artifact.model_artifact_hash)),
                             ("Selected ICPs", len(window.item_refs)),
                             ("Worker index", f"{self.config.scoring_worker_index + 1}/{self.config.scoring_worker_total_workers}"),
                         ),
@@ -523,11 +682,10 @@ class ResearchLabGatewayScoringWorker:
                 "status": "already_benchmarked",
                 "benchmark_date": today,
                 "rolling_window_hash": window.window_hash,
+                "private_model_manifest_hash": artifact.manifest_hash,
             }
         benchmark_attempt = _next_benchmark_attempt(existing)
         await create_rolling_icp_window(window)
-        active = await load_active_private_model(self.config, register_bootstrap=True)
-        artifact = active.artifact
         logger.info(
             format_worker_block(
                 "RESEARCH LAB PRIVATE BASELINE STARTED",
@@ -552,6 +710,7 @@ class ResearchLabGatewayScoringWorker:
         )
         scorer = QualificationStyleCompanyScorer()
         per_icp_summaries: list[dict[str, Any]] = []
+        nonempty_output_count = 0
         try:
             await create_scoring_dispatch_event(
                 dispatch_type="private_baseline_rebenchmark",
@@ -565,24 +724,62 @@ class ResearchLabGatewayScoringWorker:
                     "selected_icp_count": len(window.item_refs),
                 },
             )
-            for item in window.benchmark_items:
+            total_icps = len(window.benchmark_items)
+            for item_index, item in enumerate(window.benchmark_items, start=1):
+                item_start = time.time()
                 label = str(item.get("icp_ref") or item.get("icp_hash") or "unknown_icp")
                 outputs = ensure_private_model_outputs(
                     await asyncio.to_thread(runner, item["icp"], {"mode": "private_baseline"}),
                     context_label=f"private baseline for {label}",
-                    require_non_empty=True,
+                    require_non_empty=False,
                 )
+                item_elapsed = time.time() - item_start
+                if outputs:
+                    nonempty_output_count += 1
                 score_breakdowns = await scorer.score_with_breakdowns(outputs, item["icp"], True)
-                if not score_breakdowns:
-                    raise PrivateModelRuntimeError(f"private baseline produced no scoreable companies for {label}")
                 scores = [float(row.get("final_score", 0.0) or 0.0) for row in score_breakdowns]
+                icp_score = _average(scores)
+                logger.info(
+                    format_worker_block(
+                        "RESEARCH LAB PRIVATE BASELINE ICP SCORED",
+                        (
+                            ("Worker", self.worker_ref),
+                            ("ICP", f"{item_index}/{total_icps}"),
+                            ("ICP ref", compact_ref(label)),
+                            ("ICP hash", compact_ref(item.get("icp_hash"))),
+                            ("Set", item.get("set_id")),
+                            ("Day", item.get("day_index")),
+                            ("Day rank", item.get("day_rank")),
+                            ("Score", f"{icp_score:.4f}"),
+                            ("Companies", len(scores)),
+                            ("Non-empty output", bool(outputs)),
+                            ("ICP runtime", f"{item_elapsed:.1f}s"),
+                            ("Elapsed", f"{time.time() - start:.1f}s"),
+                        ),
+                    )
+                )
+                if (
+                    item_index >= PRIVATE_BASELINE_FAST_EMPTY_ABORT_AFTER
+                    and nonempty_output_count <= 0
+                    and time.time() - start < PRIVATE_BASELINE_FAST_EMPTY_ABORT_SECONDS
+                ):
+                    raise PrivateModelRuntimeError(
+                        "private baseline fast-empty guard tripped: "
+                        f"first {item_index} ICPs returned zero companies in {time.time() - start:.1f}s. "
+                        "The private model is not executing the full provider-backed sourcing path; "
+                        "check Docker env passthrough, provider keys, proxy connectivity, and ICP canonicalization."
+                    )
                 per_icp_summaries.append(
                     sanitize_benchmark_item_summary(
                         item=item,
-                        score=_average(scores),
+                        score=icp_score,
                         company_count=len(scores),
                         score_breakdowns=score_breakdowns,
                     )
+                )
+            if nonempty_output_count <= 0:
+                raise PrivateModelRuntimeError(
+                    f"private baseline returned zero companies across all {len(window.benchmark_items)} ICPs"
                 )
         except Exception as exc:
             await create_scoring_dispatch_event(
@@ -983,18 +1180,24 @@ def _private_benchmark_row_is_valid(row: Mapping[str, Any]) -> bool:
     status = str(row.get("current_benchmark_status") or row.get("benchmark_status") or "")
     if status and status != "completed":
         return False
-    if str(row.get("benchmark_quality") or "") == "passed":
-        return True
-    try:
-        if int(row.get("evaluation_epoch") or 0) <= 0:
-            return False
-    except (TypeError, ValueError):
-        return False
     doc = row.get("score_summary_doc") if isinstance(row.get("score_summary_doc"), Mapping) else {}
     summaries = doc.get("per_icp_summaries") if isinstance(doc, Mapping) else None
     if not isinstance(summaries, list) or not summaries:
         return False
-    return all(
-        isinstance(item, Mapping) and int(item.get("company_count") or 0) > 0
-        for item in summaries
-    )
+    if not any(_benchmark_summary_has_companies(item) for item in summaries):
+        return False
+    if str(row.get("benchmark_quality") or "") == "passed":
+        return True
+    try:
+        return int(row.get("evaluation_epoch") or 0) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _benchmark_summary_has_companies(item: Any) -> bool:
+    if not isinstance(item, Mapping):
+        return False
+    try:
+        return int(item.get("company_count") or 0) > 0
+    except (TypeError, ValueError):
+        return False

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from inspect import signature
 from pathlib import Path
 import sys
 import time
@@ -14,7 +15,14 @@ if str(ROOT) not in sys.path:
 
 from fastapi import HTTPException
 
-from gateway.research_lab.api import _effective_budget_doc, _validate_allowed_research_island, router
+from gateway.research_lab.api import (
+    _OPENROUTER_KEY_REGISTRATION_ATTEMPTS,
+    _enforce_openrouter_key_registration_rate_limit,
+    _effective_budget_doc,
+    _require_default_research_model_tier,
+    _validate_allowed_research_island,
+    router,
+)
 from gateway.research_lab.bundles import build_shadow_report_bundle, sha256_json
 from gateway.research_lab.config import ResearchLabGatewayConfig
 from gateway.research_lab.models import (
@@ -46,6 +54,11 @@ def main() -> int:
         errors.append("Research Lab top-ups must default disabled")
     if defaults.public_status().get("allowed_research_areas") != ["generalist"]:
         errors.append("Research Lab launch must default to generalist-only research area")
+    payment_text = (ROOT / "gateway" / "qualification" / "api" / "payment.py").read_text(encoding="utf-8")
+    helper_text = (ROOT / "gateway" / "qualification" / "utils" / "helpers.py").read_text(encoding="utf-8")
+    for marker in ("fallback TAO", "taostats.io/api/price", "return 500.0", "return 400.0"):
+        if marker in payment_text or marker in helper_text:
+            errors.append(f"TAO price path still contains non-CoinGecko fallback marker: {marker}")
     try:
         _validate_allowed_research_island(defaults, "healthcare")
         errors.append("non-generalist research area was accepted by default")
@@ -69,6 +82,11 @@ def main() -> int:
     )
     if budget_doc.get("max_compute_budget_usd") != 5.0:
         errors.append("tier max_compute_budget_usd was not enforced over miner-supplied max")
+    try:
+        _require_default_research_model_tier(tier_limited_config, "custom")
+        errors.append("non-default research model tier was accepted for launch")
+    except HTTPException:
+        pass
     try:
         _effective_budget_doc(
             tier_limited_config,
@@ -101,6 +119,16 @@ def main() -> int:
     }:
         if required not in paths:
             errors.append(f"missing route: {required}")
+    endpoints = {route.path: route.endpoint for route in router.routes}
+    for protected_path in {
+        "/research-lab/tickets/{ticket_id}",
+        "/research-lab/receipts/{receipt_id}",
+        "/research-lab/evaluations/score-bundles/{score_bundle_id}",
+        "/research-lab/evaluations/latest/{epoch}",
+    }:
+        endpoint = endpoints.get(protected_path)
+        if endpoint is None or "x_leadpoet_internal_key" not in signature(endpoint).parameters:
+            errors.append(f"raw read route is missing internal-key guard parameter: {protected_path}")
 
     ticket = ResearchLabTicketCreateRequest(
         miner_hotkey="5FminerHotkey11111111111111111111111111111111",
@@ -135,6 +163,13 @@ def main() -> int:
     ref = openrouter_key_ref(miner_hotkey=ticket.miner_hotkey, key_hash="a" * 64)
     if not ref.startswith("encrypted_ref:openrouter:") or len(ref.rsplit(":", 1)[-1]) != 32:
         errors.append("OpenRouter key ref shape is invalid")
+    try:
+        _OPENROUTER_KEY_REGISTRATION_ATTEMPTS.clear()
+        _enforce_openrouter_key_registration_rate_limit(ticket.miner_hotkey)
+    except NameError:
+        errors.append("OpenRouter key registration rate limiter helper is missing")
+    except HTTPException:
+        errors.append("first OpenRouter key registration attempt was rate limited")
 
     loop_start = ResearchLabLoopStartRequest(
         miner_hotkey=ticket.miner_hotkey,
@@ -154,6 +189,36 @@ def main() -> int:
     reparsed_loop_start = ResearchLabLoopStartRequest.model_validate(loop_start.model_dump(mode="json"))
     if reparsed_loop_start != loop_start:
         errors.append("loop-start request failed json round-trip")
+    loop_signed_payload = loop_start.signed_payload()
+    if "credit_id" in loop_signed_payload:
+        errors.append("loop-start signed payload included omitted credit_id default")
+    credit_loop_start = ResearchLabLoopStartRequest(
+        miner_hotkey=ticket.miner_hotkey,
+        signature=ticket.signature,
+        timestamp=now,
+        idempotency_key="loop-start-credit-idempotency-001",
+        ticket_id="11111111-1111-4111-8111-111111111111",
+        credit_id="loop_start_credit:" + "c" * 32,
+        miner_openrouter_key_ref="encrypted_ref:vault:miner-openrouter-key-001",
+        miner_openrouter_key_handling="encrypted_ref",
+        miner_openrouter_preflight_status="passed",
+        research_model_tier="default",
+        requested_compute_budget_usd=5.0,
+        max_compute_budget_usd=25.0,
+    )
+    reparsed_credit_loop_start = ResearchLabLoopStartRequest.model_validate(credit_loop_start.model_dump(mode="json"))
+    if reparsed_credit_loop_start != credit_loop_start:
+        errors.append("credit loop-start request failed json round-trip")
+    try:
+        ResearchLabLoopStartRequest(
+            **{
+                **loop_start.model_dump(),
+                "credit_id": "loop_start_credit:" + "d" * 32,
+            }
+        )
+        errors.append("loop-start request accepted both payment fields and credit_id")
+    except ValueError:
+        pass
 
     topup = ResearchLabLoopTopUpRequest(
         miner_hotkey=ticket.miner_hotkey,

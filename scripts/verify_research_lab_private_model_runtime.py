@@ -23,6 +23,7 @@ from research_lab.eval.private_runtime import (  # noqa: E402
     PrivateModelRuntimeError,
     SubprocessPrivateModelRunner,
     build_local_private_artifact_manifest,
+    canonicalize_private_model_icp,
     compute_private_source_tree_hash,
     ensure_private_model_outputs,
     load_private_artifact_manifest,
@@ -38,6 +39,10 @@ def main() -> int:
         adapter.write_text(
             """
 def run_icp(icp, context):
+    print("diagnostic line that must not corrupt adapter JSON")
+    required = ("required_attribute", "intent_signal", "intent_category", "employee_count", "geography")
+    if not all(icp.get(key) for key in required):
+        return []
     if context.get("patch", {}).get("patch_type") == "STRATEGY_SWAP":
         icp = dict(icp)
         icp["intent_source"] = context["patch"].get("patch_doc", {}).get("strategy_option", "news")
@@ -64,8 +69,29 @@ def run_icp(icp, context):
         )
 
         runner = SubprocessPrivateModelRunner(PrivateModelAdapterSpec(source_path=root, timeout_seconds=30))
+        research_lab_icp = {
+            "icp_id": "research_lab_fixture",
+            "industry": "Software",
+            "sub_industry": "Sales Automation",
+            "target_geography": "United States",
+            "company_size": "51-200",
+            "product_service": "AI sales automation platform",
+            "intent_signals": ["Launched or announced a new product"],
+        }
+        canonical_icp = canonicalize_private_model_icp(research_lab_icp)
+        if canonical_icp["geography"] != "United States":
+            errors.append("canonical private ICP did not map target_geography to geography")
+        if canonical_icp["employee_count"] != "51-200":
+            errors.append("canonical private ICP did not map company_size to employee_count")
+        if canonical_icp["intent_signal"] != "Launched or announced a new product":
+            errors.append("canonical private ICP did not extract intent signal text")
+        if canonical_icp["intent_category"] != "PRODUCT_LAUNCH":
+            errors.append("canonical private ICP did not infer product-launch intent category")
+        if not canonical_icp["required_attribute"].startswith("The company offers or provides"):
+            errors.append("canonical private ICP did not derive required_attribute from product_service")
+
         out = runner(
-            {"industry": "Software", "geography": "United States"},
+            research_lab_icp,
             {"patch": {"patch_type": "STRATEGY_SWAP", "patch_doc": {"strategy_option": "job_listing"}}},
         )
         if not out or out[0]["intent"]["source"] != "job_listing":
@@ -133,7 +159,7 @@ def run_icp(icp, context):
 
         class _Completed:
             returncode = 0
-            stdout = '[{"raw_secret":"should-fail"}]'
+            stdout = 'debug line before JSON\n[{"raw_secret":"should-fail"}]'
             stderr = ""
 
         def _fake_run(*_args, **_kwargs):
@@ -148,10 +174,35 @@ def run_icp(icp, context):
                         pull_before_run=False,
                         timeout_seconds=30,
                     )
-                )({}, {})
+                )(research_lab_icp, {})
                 errors.append("docker private model runner accepted raw secret output")
             except PrivateModelRuntimeError:
                 pass
+        finally:
+            private_runtime_module.subprocess.run = original_run
+
+        class _ProviderErrorCompleted:
+            returncode = 0
+            stdout = "[]"
+            stderr = "research_lab_private_runtime_provider_error HTTPError: HTTP Error 401: Unauthorized"
+
+        def _fake_provider_error_run(*_args, **_kwargs):
+            return _ProviderErrorCompleted()
+
+        private_runtime_module.subprocess.run = _fake_provider_error_run
+        try:
+            try:
+                DockerPrivateModelRunner(
+                    DockerPrivateModelSpec(
+                        image_digest="123456789012.dkr.ecr.us-east-1.amazonaws.com/leadpoet/sourcing-model@sha256:" + "8" * 64,
+                        pull_before_run=False,
+                        timeout_seconds=30,
+                    )
+                )(research_lab_icp, {})
+                errors.append("docker private model runner accepted empty output with provider error")
+            except PrivateModelRuntimeError as exc:
+                if "provider-backed sourcing failed" not in str(exc):
+                    errors.append("provider error did not produce a clear runtime failure")
         finally:
             private_runtime_module.subprocess.run = original_run
 
@@ -163,7 +214,7 @@ def run_icp(icp, context):
         try:
             SubprocessPrivateModelRunner(
                 PrivateModelAdapterSpec(source_path=root, module_name="secret_adapter", timeout_seconds=30)
-            )({}, {})
+            )(research_lab_icp, {})
             errors.append("subprocess private model runner accepted raw secret output")
         except PrivateModelRuntimeError:
             pass

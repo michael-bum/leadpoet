@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from importlib import import_module
+import os
 from typing import Any, Awaitable, Callable, Mapping, Sequence, Union
 
 from leadpoet_verifier.research_evaluation import build_research_evaluation_score_bundle
@@ -11,7 +12,7 @@ from leadpoet_verifier.research_evaluation import build_research_evaluation_scor
 from .artifacts import PrivateModelArtifactManifest, validate_private_model_artifact_manifest
 from .benchmark import SealedBenchmarkSet, validate_sealed_benchmark_set
 from .patches import CandidatePatchManifest, validate_candidate_patch_manifest
-from .private_runtime import ensure_private_model_outputs
+from .private_runtime import canonicalize_private_model_icp, ensure_private_model_outputs
 
 
 ModelRunner = Callable[
@@ -69,7 +70,7 @@ async def evaluate_private_model_pair(
         base_outputs = ensure_private_model_outputs(
             await _maybe_await(base_runner(icp, run_context)),
             context_label=f"reference model for ICP {item.get('icp_ref') or item.get('icp_hash') or ''}",
-            require_non_empty=True,
+            require_non_empty=False,
         )
         candidate_outputs = ensure_private_model_outputs(
             await _maybe_await(candidate_runner(icp, {**dict(run_context), "patch": patch.to_dict()})),
@@ -78,10 +79,15 @@ async def evaluate_private_model_pair(
         )
         base_scores = await _maybe_await(scorer(base_outputs, icp, True))
         candidate_scores = await _maybe_await(scorer(candidate_outputs, icp, False))
-        if not base_scores:
-            raise RealEvaluatorRequired(
-                f"reference model produced no scoreable companies for ICP {item.get('icp_ref') or item.get('icp_hash') or ''}"
-            )
+        failure_reasons: list[str] = []
+        if not base_outputs:
+            failure_reasons.append("reference_model_zero_companies")
+        elif not base_scores:
+            failure_reasons.append("reference_model_zero_scoreable_companies")
+        if not candidate_outputs:
+            failure_reasons.append("candidate_model_zero_companies")
+        elif not candidate_scores:
+            failure_reasons.append("candidate_model_zero_scoreable_companies")
         per_icp_results.append(
             {
                 "icp_ref": str(item.get("icp_ref") or item.get("icp_hash") or ""),
@@ -90,6 +96,7 @@ async def evaluate_private_model_pair(
                 "hard_failure": False,
                 "base_company_scores": base_scores,
                 "candidate_company_scores": candidate_scores,
+                "failure_reason": ";".join(failure_reasons),
             }
         )
 
@@ -172,11 +179,12 @@ class QualificationStyleCompanyScorer:
     ) -> list[dict[str, Any]]:
         models = import_module("gateway.qualification.models")
         scorer_module = import_module("qualification.scoring.lead_scorer")
+        _ensure_qualification_provider_env()
         CompanyOutput = getattr(models, "CompanyOutput")
         ICPPrompt = getattr(models, "ICPPrompt")
         score_company = getattr(scorer_module, "score_company")
 
-        icp_obj = ICPPrompt(**dict(icp))
+        icp_obj = ICPPrompt(**canonicalize_private_model_icp(icp))
         seen_companies: set[str] = set()
         breakdowns: list[dict[str, Any]] = []
         for company in companies:
@@ -195,6 +203,19 @@ class QualificationStyleCompanyScorer:
                 item = dict(result)
             breakdowns.append(item)
         return breakdowns
+
+
+def _ensure_qualification_provider_env() -> None:
+    openrouter_key = os.getenv("QUALIFICATION_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+    if openrouter_key:
+        os.environ.setdefault("QUALIFICATION_OPENROUTER_API_KEY", openrouter_key)
+        for module_name in (
+            "gateway.qualification.utils.helpers",
+            "qualification.scoring.verification_helpers",
+        ):
+            module = import_module(module_name)
+            if not getattr(module, "OPENROUTER_API_KEY", ""):
+                setattr(module, "OPENROUTER_API_KEY", openrouter_key)
 
 
 async def _maybe_await(value: Any) -> Any:
