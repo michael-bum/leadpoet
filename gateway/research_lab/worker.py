@@ -15,6 +15,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
+from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
 from gateway.research_lab.config import ResearchLabGatewayConfig
 from gateway.research_lab.key_vault import OpenRouterKeyVaultError, decrypt_openrouter_key
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block, format_worker_line
@@ -26,6 +27,7 @@ from gateway.research_lab.loop_engine import (
 )
 from gateway.research_lab.models import ResearchLabCandidateArtifactCreateRequest, ResearchLabReceiptCreateRequest
 from gateway.research_lab.promotion import latest_public_benchmark_summary, load_active_private_model
+from gateway.research_lab.public_activity import safe_project_public_loop_activity
 from gateway.research_lab.store import (
     canonical_hash,
     create_auto_research_loop_event,
@@ -659,6 +661,12 @@ class ResearchLabHostedWorker:
                 "next_stage": "gateway_qualification_worker_evaluation",
             },
         )
+        await safe_project_public_loop_activity(
+            context.ticket_id,
+            source_ref=f"hosted_worker_completed:{context.run_id}",
+            reason="candidate_generation_completed_evaluation_queued",
+            config=self.config,
+        )
         logger.info(
             format_worker_block(
                 "RESEARCH LAB AUTO-RESEARCH QUEUED CANDIDATES",
@@ -722,9 +730,10 @@ class ResearchLabHostedWorker:
         }
         award_obj = compute_reimbursement_award(run_cost, snapshot_doc, policy, ReimbursementCapUsage.from_mapping(cap_usage))
         award = award_obj.to_dict()
+        evaluation_epoch, _block, _source = await resolve_research_lab_evaluation_epoch(self.config.evaluation_epoch)
         schedule = build_reimbursement_schedule(
             award,
-            start_epoch=max(0, int(self.config.evaluation_epoch or 0) + (1 if self.config.evaluation_epoch else 0)),
+            start_epoch=max(0, int(evaluation_epoch) + 1),
         ).to_dict()
         shadow_only = not self.config.reimbursements_enabled
         award_doc = {
@@ -737,6 +746,7 @@ class ResearchLabHostedWorker:
             "shadow_only": shadow_only,
             "submission_allowed": self.config.reimbursements_enabled,
             "source": "hosted_auto_research_loop_completion",
+            "evaluation_epoch": int(evaluation_epoch),
         }
         schedule_doc = {
             "schema_version": "1.0",
@@ -744,6 +754,7 @@ class ResearchLabHostedWorker:
             "shadow_only": shadow_only,
             "submission_allowed": self.config.reimbursements_enabled,
             "source": "hosted_auto_research_loop_completion",
+            "evaluation_epoch": int(evaluation_epoch),
         }
         award_row, _award_event = await create_reimbursement_award(
             award=award,
@@ -877,6 +888,12 @@ class ResearchLabHostedWorker:
             reason="hosted_worker_started",
             event_doc={"run_id": context.run_id, "worker_ref": self.worker_ref},
         )
+        await safe_project_public_loop_activity(
+            context.ticket_id,
+            source_ref=f"hosted_worker_started:{context.run_id}",
+            reason="hosted_worker_started",
+            config=self.config,
+        )
 
     async def _mark_failed(self, context: HostedRunContext, error: str) -> HostedWorkerOutcome:
         event_doc = {"run_id": context.run_id, "worker_ref": self.worker_ref, "error": error[:500]}
@@ -907,6 +924,12 @@ class ResearchLabHostedWorker:
             actor_hotkey=None,
             reason="hosted_research_lab_run_failed",
             event_doc={**event_doc, "receipt_id": receipt_id},
+        )
+        await safe_project_public_loop_activity(
+            context.ticket_id,
+            source_ref=f"hosted_worker_failed:{context.run_id}",
+            reason="hosted_research_lab_run_failed",
+            config=self.config,
         )
         return HostedWorkerOutcome(
             processed=True,
@@ -1097,6 +1120,8 @@ class ResearchLabHostedWorker:
             context_doc["additional_compute_budget_usd"] = self.config.clamp_compute_budget_usd(additional_budget)
         if queue_doc.get("continue_from_run_id"):
             context_doc["continue_from_run_id"] = str(queue_doc["continue_from_run_id"])
+        if isinstance(queue_doc.get("continuation_context"), Mapping):
+            context_doc["continuation_context"] = dict(queue_doc["continuation_context"])
         if queue_doc.get("topup_reason"):
             context_doc["topup_reason"] = str(queue_doc["topup_reason"])
         return context_doc
@@ -1207,6 +1232,7 @@ def _redacted_budget_context(value: Mapping[str, Any]) -> dict[str, Any]:
         "budget_policy_version",
         "additional_compute_budget_usd",
         "continue_from_run_id",
+        "continuation_context",
         "topup_reason",
     }
     return {key: value[key] for key in allowed if key in value}

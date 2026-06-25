@@ -10,6 +10,7 @@ import time
 from typing import Any, Mapping
 
 from gateway.research_lab.bundles import build_research_lab_audit_bundle
+from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
 from gateway.research_lab.config import ResearchLabGatewayConfig
 from gateway.research_lab.icp_window import (
     RollingIcpWindowUnavailable,
@@ -18,6 +19,7 @@ from gateway.research_lab.icp_window import (
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block
 from gateway.research_lab.models import ResearchLabScoreBundleCreateRequest
 from gateway.research_lab.promotion import ResearchLabPromotionController, load_active_private_model
+from gateway.research_lab.public_activity import safe_project_public_loop_activity
 from gateway.research_lab.public_benchmarks import (
     build_benchmark_visibility_split,
     build_public_benchmark_report,
@@ -43,8 +45,10 @@ from research_lab.eval import (
     DockerPrivateModelRunner,
     DockerPrivateModelSpec,
     PrivateModelArtifactManifest,
+    PrivateModelRuntimeError,
     SealedBenchmarkSet,
     evaluate_private_model_pair,
+    ensure_private_model_outputs,
     sign_digest_with_kms,
 )
 from research_lab.eval.evaluator import QualificationStyleCompanyScorer
@@ -82,6 +86,7 @@ class ResearchLabGatewayScoringWorker:
         self.proxy_ref_hash = canonical_hash({"proxy_ref": self.proxy_url}) if self.proxy_url else None
         self._baseline_skip_logged = False
         self._baseline_already_logged_date: str | None = None
+        self._resolved_epoch_cache: tuple[int, float] | None = None
 
     async def run_forever(self) -> None:
         last_idle_log = 0.0
@@ -216,6 +221,12 @@ class ResearchLabGatewayScoringWorker:
                 "proxy_ref_hash": self.proxy_ref_hash,
             },
         )
+        await safe_project_public_loop_activity(
+            str(candidate["ticket_id"]),
+            source_ref=f"candidate_assigned:{candidate_id}",
+            reason="assigned_to_gateway_qualification_worker",
+            config=self.config,
+        )
         logger.info(
             format_worker_block(
                 "RESEARCH LAB CANDIDATE ALLOCATED",
@@ -233,29 +244,31 @@ class ResearchLabGatewayScoringWorker:
     async def _score_candidate(self, candidate: Mapping[str, Any]) -> None:
         candidate_id = str(candidate["candidate_id"])
         start = time.time()
-        await create_scoring_dispatch_event(
-            dispatch_type="candidate_scoring",
-            dispatch_status="assigned",
-            worker_ref=self.worker_ref,
-            proxy_ref_hash=self.proxy_ref_hash,
-            candidate_id=candidate_id,
-            run_id=str(candidate["run_id"]),
-            ticket_id=str(candidate["ticket_id"]),
-        )
-        logger.info(
-            format_worker_block(
-                "RESEARCH LAB CANDIDATE SCORING STARTED",
-                (
-                    ("Worker", self.worker_ref),
-                    ("Candidate", compact_ref(candidate_id)),
-                    ("Run", compact_ref(candidate.get("run_id"))),
-                    ("Ticket", compact_ref(candidate.get("ticket_id"))),
-                    ("Model timeout", f"{self.config.scoring_worker_model_timeout_seconds}s"),
-                    ("Proxy ref", self.proxy_ref_hash),
-                ),
-            )
-        )
         try:
+            evaluation_epoch = await self._resolve_evaluation_epoch()
+            await create_scoring_dispatch_event(
+                dispatch_type="candidate_scoring",
+                dispatch_status="assigned",
+                worker_ref=self.worker_ref,
+                proxy_ref_hash=self.proxy_ref_hash,
+                candidate_id=candidate_id,
+                run_id=str(candidate["run_id"]),
+                ticket_id=str(candidate["ticket_id"]),
+            )
+            logger.info(
+                format_worker_block(
+                    "RESEARCH LAB CANDIDATE SCORING STARTED",
+                    (
+                        ("Worker", self.worker_ref),
+                        ("Candidate", compact_ref(candidate_id)),
+                        ("Run", compact_ref(candidate.get("run_id"))),
+                        ("Ticket", compact_ref(candidate.get("ticket_id"))),
+                        ("Evaluation epoch", evaluation_epoch),
+                        ("Model timeout", f"{self.config.scoring_worker_model_timeout_seconds}s"),
+                        ("Proxy ref", self.proxy_ref_hash),
+                    ),
+                )
+            )
             await create_candidate_evaluation_event(
                 candidate_id=candidate_id,
                 run_id=str(candidate["run_id"]),
@@ -290,7 +303,11 @@ class ResearchLabGatewayScoringWorker:
                     extra_env=self._private_scoring_env(),
                 )
             )
-            run_context = self._candidate_run_context(candidate, window_hash=window.window_hash)
+            run_context = self._candidate_run_context(
+                candidate,
+                window_hash=window.window_hash,
+                evaluation_epoch=evaluation_epoch,
+            )
             score_bundle = await evaluate_private_model_pair(
                 artifact_manifest=artifact,
                 benchmark=benchmark,
@@ -350,6 +367,12 @@ class ResearchLabGatewayScoringWorker:
                 score_bundle=score_bundle,
             )
             await self._maybe_finalize_candidate_receipt(candidate)
+            await safe_project_public_loop_activity(
+                str(candidate["ticket_id"]),
+                source_ref=f"candidate_scored:{candidate_id}:{bundle['score_bundle_id']}",
+                reason="gateway_qualification_worker_scored_candidate",
+                config=self.config,
+            )
             await self._write_audit_bundle(int(run_context["evaluation_epoch"]))
             logger.info(
                 format_worker_block(
@@ -392,8 +415,14 @@ class ResearchLabGatewayScoringWorker:
                 event_doc={"error": str(exc)[:500]},
             )
             await self._maybe_finalize_candidate_receipt(candidate)
+            await safe_project_public_loop_activity(
+                str(candidate["ticket_id"]),
+                source_ref=f"candidate_failed:{candidate_id}",
+                reason="gateway_qualification_worker_failed",
+                config=self.config,
+            )
             try:
-                await self._write_audit_bundle(int(self.config.evaluation_epoch or 0))
+                await self._write_audit_bundle(await self._resolve_evaluation_epoch())
             except Exception:
                 logger.exception("Research Lab audit bundle write failed after candidate failure")
             logger.exception(
@@ -445,6 +474,7 @@ class ResearchLabGatewayScoringWorker:
     async def _maybe_run_private_baseline(self) -> dict[str, Any] | None:
         today = datetime.now(timezone.utc).date().isoformat()
         start = time.time()
+        evaluation_epoch = await self._resolve_evaluation_epoch()
         logger.info(
             format_worker_block(
                 "RESEARCH LAB PRIVATE BASELINE ALLOCATED",
@@ -453,6 +483,7 @@ class ResearchLabGatewayScoringWorker:
                     ("Worker index", f"{self.config.scoring_worker_index + 1}/{self.config.scoring_worker_total_workers}"),
                     ("Proxy ref", self.proxy_ref_hash),
                     ("Benchmark date", today),
+                    ("Evaluation epoch", evaluation_epoch),
                     ("Eval days", self.config.lab_champion_eval_days),
                     ("ICPs per day", self.config.lab_champion_icps_per_day),
                     ("Expected ICPs", self.config.lab_champion_eval_days * self.config.lab_champion_icps_per_day),
@@ -465,12 +496,14 @@ class ResearchLabGatewayScoringWorker:
             allow_partial=self.config.scoring_worker_allow_partial_icp_window,
         )
         existing = await select_many(
-            "research_lab_private_model_benchmark_bundles",
-            columns="benchmark_bundle_id",
+            "research_lab_private_model_benchmark_current",
+            columns="*",
             filters=(("benchmark_date", today), ("rolling_window_hash", window.window_hash)),
-            limit=1,
+            order_by=(("created_at", True),),
+            limit=25,
         )
-        if existing:
+        valid_existing = [row for row in existing if _private_benchmark_row_is_valid(row)]
+        if valid_existing:
             already_key = f"{today}:{window.window_hash}"
             if self._baseline_already_logged_date != already_key:
                 logger.info(
@@ -491,6 +524,7 @@ class ResearchLabGatewayScoringWorker:
                 "benchmark_date": today,
                 "rolling_window_hash": window.window_hash,
             }
+        benchmark_attempt = _next_benchmark_attempt(existing)
         await create_rolling_icp_window(window)
         active = await load_active_private_model(self.config, register_bootstrap=True)
         artifact = active.artifact
@@ -502,6 +536,7 @@ class ResearchLabGatewayScoringWorker:
                     ("Worker index", f"{self.config.scoring_worker_index + 1}/{self.config.scoring_worker_total_workers}"),
                     ("Proxy ref", self.proxy_ref_hash),
                     ("Rolling window", compact_ref(window.window_hash)),
+                    ("Evaluation epoch", evaluation_epoch),
                     ("Selected sets", len(window.set_ids)),
                     ("Selected ICPs", len(window.item_refs)),
                     ("Private model", compact_ref(artifact.model_artifact_hash)),
@@ -517,18 +552,72 @@ class ResearchLabGatewayScoringWorker:
         )
         scorer = QualificationStyleCompanyScorer()
         per_icp_summaries: list[dict[str, Any]] = []
-        for item in window.benchmark_items:
-            outputs = await asyncio.to_thread(runner, item["icp"], {"mode": "private_baseline"})
-            score_breakdowns = await scorer.score_with_breakdowns(outputs, item["icp"], True)
-            scores = [float(row.get("final_score", 0.0) or 0.0) for row in score_breakdowns]
-            per_icp_summaries.append(
-                sanitize_benchmark_item_summary(
-                    item=item,
-                    score=_average(scores),
-                    company_count=len(scores),
-                    score_breakdowns=score_breakdowns,
+        try:
+            await create_scoring_dispatch_event(
+                dispatch_type="private_baseline_rebenchmark",
+                dispatch_status="assigned",
+                worker_ref=self.worker_ref,
+                proxy_ref_hash=self.proxy_ref_hash,
+                rolling_window_hash=window.window_hash,
+                event_doc={
+                    "benchmark_date": today,
+                    "benchmark_attempt": benchmark_attempt,
+                    "selected_icp_count": len(window.item_refs),
+                },
+            )
+            for item in window.benchmark_items:
+                label = str(item.get("icp_ref") or item.get("icp_hash") or "unknown_icp")
+                outputs = ensure_private_model_outputs(
+                    await asyncio.to_thread(runner, item["icp"], {"mode": "private_baseline"}),
+                    context_label=f"private baseline for {label}",
+                    require_non_empty=True,
+                )
+                score_breakdowns = await scorer.score_with_breakdowns(outputs, item["icp"], True)
+                if not score_breakdowns:
+                    raise PrivateModelRuntimeError(f"private baseline produced no scoreable companies for {label}")
+                scores = [float(row.get("final_score", 0.0) or 0.0) for row in score_breakdowns]
+                per_icp_summaries.append(
+                    sanitize_benchmark_item_summary(
+                        item=item,
+                        score=_average(scores),
+                        company_count=len(scores),
+                        score_breakdowns=score_breakdowns,
+                    )
+                )
+        except Exception as exc:
+            await create_scoring_dispatch_event(
+                dispatch_type="private_baseline_rebenchmark",
+                dispatch_status="failed",
+                worker_ref=self.worker_ref,
+                proxy_ref_hash=self.proxy_ref_hash,
+                rolling_window_hash=window.window_hash,
+                event_doc={
+                    "benchmark_date": today,
+                    "benchmark_attempt": benchmark_attempt,
+                    "selected_icp_count": len(window.item_refs),
+                    "error": str(exc)[:500],
+                    "elapsed_seconds": round(time.time() - start, 3),
+                },
+            )
+            logger.exception(
+                format_worker_block(
+                    "RESEARCH LAB PRIVATE BASELINE FAILED",
+                    (
+                        ("Worker", self.worker_ref),
+                        ("Benchmark date", today),
+                        ("Rolling window", compact_ref(window.window_hash)),
+                        ("Evaluation epoch", evaluation_epoch),
+                        ("Attempt", benchmark_attempt),
+                        ("Error", str(exc)[:300]),
+                    ),
                 )
             )
+            return {
+                "status": "failed",
+                "benchmark_date": today,
+                "rolling_window_hash": window.window_hash,
+                "error": str(exc)[:300],
+            }
         aggregate_score = _average([summary["score"] for summary in per_icp_summaries])
         visibility_split = build_benchmark_visibility_split(
             rolling_window_hash=window.window_hash,
@@ -539,6 +628,8 @@ class ResearchLabGatewayScoringWorker:
         )
         score_summary_doc = {
             "schema_version": "1.0",
+            "benchmark_quality": "passed",
+            "benchmark_attempt": benchmark_attempt,
             "rolling_window_hash": window.window_hash,
             "per_icp_summaries": per_icp_summaries,
             "visibility_split": visibility_split,
@@ -557,7 +648,9 @@ class ResearchLabGatewayScoringWorker:
             private_model_artifact_hash=artifact.model_artifact_hash,
             private_model_manifest_hash=artifact.manifest_hash,
             rolling_window_hash=window.window_hash,
-            evaluation_epoch=int(self.config.evaluation_epoch or 0),
+            evaluation_epoch=evaluation_epoch,
+            benchmark_attempt=benchmark_attempt,
+            benchmark_quality="passed",
             aggregate_score=aggregate_score,
             scoring_worker_ref=self.worker_ref,
             proxy_ref_hash=self.proxy_ref_hash,
@@ -595,9 +688,11 @@ class ResearchLabGatewayScoringWorker:
             private_model_manifest_hash=artifact.manifest_hash,
             rolling_window_hash=window.window_hash,
             aggregate_score=aggregate_score,
+            benchmark_attempt=benchmark_attempt,
+            benchmark_quality="passed",
             report_doc=public_report_doc,
         )
-        await self._write_audit_bundle(int(self.config.evaluation_epoch or 0))
+        await self._write_audit_bundle(evaluation_epoch)
         logger.info(
             format_worker_block(
                 "RESEARCH LAB PRIVATE BASELINE COMPLETED",
@@ -607,7 +702,9 @@ class ResearchLabGatewayScoringWorker:
                     ("Benchmark bundle", compact_ref(bundle["benchmark_bundle_id"])),
                     ("Public report", compact_ref(public_report["report_id"])),
                     ("Rolling window", compact_ref(window.window_hash)),
+                    ("Evaluation epoch", evaluation_epoch),
                     ("Selected ICPs", len(window.item_refs)),
+                    ("Attempt", benchmark_attempt),
                     ("Public ICPs", visibility_split.get("public_count")),
                     ("Private holdout ICPs", visibility_split.get("private_count")),
                     ("Public strength", visibility_split.get("public_strength_counts")),
@@ -627,6 +724,28 @@ class ResearchLabGatewayScoringWorker:
 
     def _is_private_baseline_owner(self) -> bool:
         return self.config.scoring_worker_index == 0
+
+    async def _resolve_evaluation_epoch(self) -> int:
+        now = time.monotonic()
+        if self._resolved_epoch_cache is not None:
+            cached_epoch, cached_at = self._resolved_epoch_cache
+            if now - cached_at <= 60.0:
+                return cached_epoch
+
+        epoch, block, source = await resolve_research_lab_evaluation_epoch(self.config.evaluation_epoch)
+
+        if epoch <= 0:
+            raise RuntimeError(
+                "Research Lab evaluation epoch resolved to 0; refusing to write epoch-0 score/audit bundles"
+            )
+        self._resolved_epoch_cache = (epoch, now)
+        logger.info(
+            "Research Lab scoring worker resolved evaluation epoch: epoch=%s block=%s source=%s",
+            epoch,
+            block,
+            source,
+        )
+        return epoch
 
     async def _write_audit_bundle(self, epoch: int) -> None:
         ticket_rows = await select_many("research_loop_ticket_current", filters=(), limit=1000)
@@ -767,13 +886,19 @@ class ResearchLabGatewayScoringWorker:
         )
         return True
 
-    def _candidate_run_context(self, candidate: Mapping[str, Any], *, window_hash: str) -> dict[str, Any]:
+    def _candidate_run_context(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        window_hash: str,
+        evaluation_epoch: int,
+    ) -> dict[str, Any]:
         return {
             "run_id": str(candidate["run_id"]),
             "ticket_id": str(candidate["ticket_id"]),
             "miner_hotkey": str(candidate["miner_hotkey"]),
             "island": str(candidate.get("island") or "generalist"),
-            "evaluation_epoch": int(self.config.evaluation_epoch or 0),
+            "evaluation_epoch": int(evaluation_epoch),
             "evaluator_version": "leadpoet-gateway-qualification-worker:research-lab:v1",
             "evidence_bundle_refs": [f"research_lab_rolling_icp_window:{window_hash}"],
             "execution_trace_ref": f"gateway_qualification_worker:{self.worker_ref}:{candidate['candidate_id']}",
@@ -842,3 +967,34 @@ class ResearchLabGatewayScoringWorker:
 
 def _average(values: list[float]) -> float:
     return float(sum(values) / len(values)) if values else 0.0
+
+
+def _next_benchmark_attempt(rows: list[Mapping[str, Any]]) -> int:
+    attempts: list[int] = []
+    for row in rows:
+        try:
+            attempts.append(int(row.get("benchmark_attempt") or 0))
+        except (TypeError, ValueError):
+            attempts.append(0)
+    return (max(attempts) + 1) if attempts else 0
+
+
+def _private_benchmark_row_is_valid(row: Mapping[str, Any]) -> bool:
+    status = str(row.get("current_benchmark_status") or row.get("benchmark_status") or "")
+    if status and status != "completed":
+        return False
+    if str(row.get("benchmark_quality") or "") == "passed":
+        return True
+    try:
+        if int(row.get("evaluation_epoch") or 0) <= 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    doc = row.get("score_summary_doc") if isinstance(row.get("score_summary_doc"), Mapping) else {}
+    summaries = doc.get("per_icp_summaries") if isinstance(doc, Mapping) else None
+    if not isinstance(summaries, list) or not summaries:
+        return False
+    return all(
+        isinstance(item, Mapping) and int(item.get("company_count") or 0) > 0
+        for item in summaries
+    )
