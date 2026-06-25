@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+import json
 import logging
 import os
 import re
@@ -262,6 +263,12 @@ async def start_research_lab_paid_loop(payload: ResearchLabLoopStartRequest):
         raise HTTPException(status_code=400, detail="miner OpenRouter key preflight must pass before queueing")
     await _verify_signed_miner(payload)
     ticket = await _get_ticket_for_miner(str(payload.ticket_id), payload.miner_hotkey)
+    await _validate_miner_openrouter_key_ref(
+        config,
+        miner_hotkey=payload.miner_hotkey,
+        key_ref=payload.miner_openrouter_key_ref,
+        key_handling=payload.miner_openrouter_key_handling,
+    )
     await _enforce_autoresearch_loop_capacity(config, payload.miner_hotkey)
     _validate_allowed_research_island(config, str(ticket.get("island") or ""))
     _require_default_research_model_tier(config, payload.research_model_tier)
@@ -348,10 +355,28 @@ async def start_research_lab_paid_loop(payload: ResearchLabLoopStartRequest):
                 "payment_ref": payment_ref,
                 "payment_kind": "loop_start_credit" if consumed_credit else "loop_start",
                 "loop_start_credit_id": payload.credit_id,
+                "miner_openrouter_key_ref": payload.miner_openrouter_key_ref,
+                "miner_openrouter_key_handling": payload.miner_openrouter_key_handling,
                 "requested_loop_count": payload.requested_loop_count,
+                **_queue_capacity_doc(config),
                 **budget_doc,
             },
         )
+        capacity_error = await _post_queue_capacity_error(
+            config,
+            run_id=run_id,
+            miner_hotkey=payload.miner_hotkey,
+        )
+        if capacity_error:
+            await create_queue_event(
+                run_id=run_id,
+                ticket_id=str(payload.ticket_id),
+                event_type="cancelled",
+                queue_priority=0,
+                reason="capacity_rejected_after_queue",
+                event_doc={"error": capacity_error},
+            )
+            raise RuntimeError(capacity_error)
         await create_ticket_event(
             ticket_id=str(payload.ticket_id),
             event_type="queued",
@@ -424,6 +449,12 @@ async def top_up_research_lab_paid_loop(payload: ResearchLabLoopTopUpRequest):
         raise HTTPException(status_code=400, detail="miner OpenRouter key preflight must pass before queueing")
     await _verify_signed_miner(payload)
     ticket = await _get_ticket_for_miner(str(payload.ticket_id), payload.miner_hotkey)
+    await _validate_miner_openrouter_key_ref(
+        config,
+        miner_hotkey=payload.miner_hotkey,
+        key_ref=payload.miner_openrouter_key_ref,
+        key_handling=payload.miner_openrouter_key_handling,
+    )
     _validate_allowed_research_island(config, str(ticket.get("island") or ""))
     if not payload.continue_from_run_id:
         raise HTTPException(status_code=400, detail="continue_from_run_id is required for Research Lab top-ups")
@@ -501,7 +532,11 @@ async def top_up_research_lab_paid_loop(payload: ResearchLabLoopTopUpRequest):
             reason="loop_topup_queued",
             event_doc={
                 "payment_id": payment["payment_id"],
+                "payment_ref": payment_ref,
                 "payment_kind": "top_up",
+                "miner_openrouter_key_ref": payload.miner_openrouter_key_ref,
+                "miner_openrouter_key_handling": payload.miner_openrouter_key_handling,
+                **_queue_capacity_doc(config),
                 **budget_doc,
             },
         )
@@ -1016,6 +1051,57 @@ async def _get_ticket_for_miner(ticket_id: str, miner_hotkey: str) -> dict[str, 
     return ticket
 
 
+async def _validate_miner_openrouter_key_ref(
+    config: ResearchLabGatewayConfig,
+    *,
+    miner_hotkey: str,
+    key_ref: str,
+    key_handling: str,
+) -> None:
+    if not config.miner_openrouter_key_required:
+        return
+    normalized_ref = str(key_ref or "").strip()
+    normalized_handling = str(key_handling or "").strip()
+    normalized_hotkey = str(miner_hotkey or "").strip()
+    if not normalized_ref:
+        raise HTTPException(status_code=400, detail="miner OpenRouter key ref is required")
+    if normalized_handling == "encrypted_ref":
+        if not normalized_ref.startswith("encrypted_ref:openrouter:"):
+            raise HTTPException(status_code=400, detail="encrypted OpenRouter key ref is required")
+        row = await select_one(
+            "research_lab_openrouter_key_refs",
+            columns="key_ref,miner_hotkey,preflight_status",
+            filters=(("key_ref", normalized_ref), ("miner_hotkey", normalized_hotkey)),
+        )
+        if not row:
+            raise HTTPException(status_code=400, detail="miner OpenRouter key ref was not found for this hotkey")
+        if str(row.get("preflight_status") or "") != "passed":
+            raise HTTPException(status_code=400, detail="miner OpenRouter key ref has not passed preflight")
+        return
+    if normalized_handling == "ephemeral_ref":
+        env_name = _openrouter_env_name_for_ref(config, normalized_ref)
+        if not env_name:
+            raise HTTPException(status_code=400, detail="ephemeral OpenRouter key refs are not configured")
+        if not os.getenv(env_name):
+            raise HTTPException(status_code=400, detail="configured OpenRouter key env var is empty")
+        return
+    raise HTTPException(status_code=400, detail="unsupported miner OpenRouter key handling")
+
+
+def _openrouter_env_name_for_ref(config: ResearchLabGatewayConfig, key_ref: str) -> str:
+    if config.miner_openrouter_key_ref_env_map_json:
+        try:
+            mapping = json.loads(config.miner_openrouter_key_ref_env_map_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(status_code=503, detail="OpenRouter key ref env map is invalid") from exc
+        if not isinstance(mapping, Mapping):
+            raise HTTPException(status_code=503, detail="OpenRouter key ref env map must be an object")
+        mapped = mapping.get(str(key_ref))
+        if mapped:
+            return str(mapped)
+    return str(config.miner_openrouter_key_env_var or "")
+
+
 def _require_enabled(enabled: bool, detail: str) -> None:
     if not enabled:
         raise HTTPException(status_code=403, detail=detail)
@@ -1097,7 +1183,13 @@ async def _consume_loop_start_credit(
 
 def _is_credit_claim_race_error(exc: BaseException) -> bool:
     message = str(exc).lower()
-    return "duplicate" in message and "research_loop_start_credit_events_credit_seq_key" in message
+    return (
+        "research_lab_credit_consume_conflict" in message
+        or "research_loop_start_credit_events_credit_seq_key" in message
+        or "duplicate key" in message
+        or "unique constraint" in message
+        or "23505" in message
+    )
 
 
 def _validate_requested_model_and_budget(
@@ -1242,6 +1334,42 @@ async def _enforce_autoresearch_loop_capacity(config: ResearchLabGatewayConfig, 
         )
 
 
+async def _post_queue_capacity_error(
+    config: ResearchLabGatewayConfig,
+    *,
+    run_id: str,
+    miner_hotkey: str,
+) -> str | None:
+    active_rows = [
+        row
+        for row in await _active_autoresearch_queue_rows()
+        if _autoresearch_active_row_is_fresh(row, config)
+    ]
+    capacity = _autoresearch_loop_capacity(config)
+    if capacity <= 0:
+        return "too many autoresearch loops right now, try again later"
+    normalized_run_id = str(run_id or "")
+    if not any(str(row.get("run_id") or "") == normalized_run_id for row in active_rows):
+        return None
+    ticket_map = await _ticket_rows_by_id(active_rows)
+    normalized_hotkey = str(miner_hotkey or "").strip()
+    same_hotkey_rows = [
+        row
+        for row in active_rows
+        if str((ticket_map.get(str(row.get("ticket_id") or "")) or {}).get("miner_hotkey") or "").strip()
+        == normalized_hotkey
+    ]
+    same_hotkey_rows.sort(key=_autoresearch_capacity_sort_key)
+    if same_hotkey_rows and str(same_hotkey_rows[0].get("run_id") or "") != normalized_run_id:
+        return "autoresearch loop for this hotkey already running"
+
+    active_rows.sort(key=_autoresearch_capacity_sort_key)
+    admitted_run_ids = {str(row.get("run_id") or "") for row in active_rows[:capacity]}
+    if len(active_rows) > capacity and normalized_run_id not in admitted_run_ids:
+        return "too many autoresearch loops right now, try again later"
+    return None
+
+
 async def _active_autoresearch_queue_rows() -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for status in sorted(ACTIVE_AUTORESEARCH_QUEUE_STATUSES):
@@ -1256,6 +1384,17 @@ async def _active_autoresearch_queue_rows() -> list[dict[str, Any]]:
             )
         )
     return rows
+
+
+def _autoresearch_capacity_sort_key(row: Mapping[str, Any]) -> tuple[datetime, str]:
+    raw_status_at = row.get("current_status_at")
+    try:
+        status_at = datetime.fromisoformat(str(raw_status_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        status_at = datetime.max.replace(tzinfo=timezone.utc)
+    if status_at.tzinfo is None:
+        status_at = status_at.replace(tzinfo=timezone.utc)
+    return status_at.astimezone(timezone.utc), str(row.get("run_id") or "")
 
 
 async def _ticket_rows_by_id(queue_rows: Sequence[Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -1288,6 +1427,14 @@ def _autoresearch_loop_capacity(config: ResearchLabGatewayConfig) -> int:
     if config.hosted_worker_proxy_url:
         return 1
     return 0
+
+
+def _queue_capacity_doc(config: ResearchLabGatewayConfig) -> dict[str, int | str]:
+    return {
+        "autoresearch_capacity_policy": "proxy_worker_capacity:v1",
+        "autoresearch_capacity": int(_autoresearch_loop_capacity(config)),
+        "active_loop_stale_after_seconds": max(60, int(config.active_loop_stale_after_seconds or 7200)),
+    }
 
 
 def _configured_autoresearch_proxy_count() -> int:
@@ -1518,6 +1665,7 @@ async def _maybe_finalize_candidate_receipt(candidate: dict[str, object]) -> boo
 
 def _raise_storage_error(exc: Exception) -> None:
     message = _redact_storage_error_text(str(exc))
+    message_lower = message.lower()
     json_detail = getattr(exc, "json", None)
     if callable(json_detail):
         try:
@@ -1530,8 +1678,12 @@ def _raise_storage_error(exc: Exception) -> None:
         message,
         _redact_storage_error_text(str(json_detail)) if json_detail else None,
     )
-    if "does not exist" in message or "relation" in message:
+    if "does not exist" in message_lower or "relation" in message_lower:
         raise HTTPException(status_code=503, detail="Research Lab SQL migrations are not applied") from exc
+    if "research_lab_queue_hotkey_conflict" in message_lower:
+        raise HTTPException(status_code=409, detail="autoresearch loop for this hotkey already running") from exc
+    if "research_lab_queue_capacity_conflict" in message_lower:
+        raise HTTPException(status_code=409, detail="too many autoresearch loops right now, try again later") from exc
     raise HTTPException(status_code=500, detail="Research Lab storage operation failed") from exc
 
 
