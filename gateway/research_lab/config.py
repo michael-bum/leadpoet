@@ -92,6 +92,23 @@ def _normalized_csv(name: str, default: str) -> tuple[str, ...]:
     return tuple(normalized or ("generalist",))
 
 
+def _tuple_from_json_or_csv(raw: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    if text.startswith("["):
+        try:
+            decoded = json.loads(text)
+        except json.JSONDecodeError:
+            return default
+        if not isinstance(decoded, list):
+            return default
+        values = [str(item).strip() for item in decoded if str(item).strip()]
+    else:
+        values = [item.strip() for item in text.split(",") if item.strip()]
+    return tuple(values or default)
+
+
 @dataclass(frozen=True)
 class ResearchLabGatewayConfig:
     api_enabled: bool = False
@@ -114,13 +131,14 @@ class ResearchLabGatewayConfig:
     auto_promotion_enabled: bool = False
     auto_commit_enabled: bool = False
     miner_openrouter_key_required: bool = True
+    max_open_tickets_per_hotkey: int = 3
     loop_start_fee_usd: float = DEFAULT_LOOP_START_FEE_USD
     allowed_research_islands: tuple[str, ...] = ("generalist",)
     internal_api_key: str = ""
     hosted_worker_enabled: bool = False
     hosted_worker_poll_seconds: int = 15
     hosted_worker_max_runs: int = 0
-    hosted_worker_max_candidates: int = 3
+    hosted_worker_max_candidates: int = 1
     hosted_worker_dry_run: bool = False
     hosted_worker_id: str = ""
     hosted_worker_index: int = 0
@@ -139,13 +157,14 @@ class ResearchLabGatewayConfig:
     scoring_worker_require_proxy: bool = False
     scoring_worker_proxy_url: str = ""
     scoring_worker_model_timeout_seconds: int = 900
+    scoring_worker_max_claim_requeues: int = 3
     private_model_docker_global_proxy_enabled: bool = False
     scoring_worker_allow_partial_icp_window: bool = False
     private_baseline_rebenchmark_enabled: bool = False
     auto_research_min_seconds: int = 600
-    auto_research_max_seconds: int = 1800
-    auto_research_min_iterations: int = 2
-    auto_research_max_iterations: int = 12
+    auto_research_max_seconds: int = 2700
+    auto_research_min_iterations: int = 3
+    auto_research_max_iterations: int = 6
     auto_research_draft_timeout_seconds: int = 90
     auto_research_reflection_timeout_seconds: int = 90
     auto_research_estimated_iteration_cost_usd: float = 0.5
@@ -193,6 +212,11 @@ class ResearchLabGatewayConfig:
     private_build_cmd: str = ""
     private_artifact_manifest_output: str = ""
     private_benchmark_path: str = ""
+    code_edit_candidates_enabled: bool = True
+    code_edit_build_timeout_seconds: int = 900
+    code_edit_allowed_paths_json: str = ""
+    code_edit_allowed_exact_paths_json: str = ""
+    code_edit_allowed_suffixes_json: str = ""
     score_bundle_kms_key_id: str = "alias/leadpoet-research-lab-artifact-signing"
     score_bundle_signature_uri_prefix: str = ""
     auto_research_model: str = ""
@@ -245,13 +269,17 @@ class ResearchLabGatewayConfig:
             auto_promotion_enabled=_truthy("RESEARCH_LAB_AUTO_PROMOTION_ENABLED"),
             auto_commit_enabled=_truthy("RESEARCH_LAB_AUTO_COMMIT_ENABLED"),
             miner_openrouter_key_required=_truthy("RESEARCH_LAB_MINER_OPENROUTER_KEY_REQUIRED", "true"),
+            max_open_tickets_per_hotkey=max(
+                1,
+                _int("RESEARCH_LAB_MAX_OPEN_TICKETS_PER_HOTKEY", 3),
+            ),
             loop_start_fee_usd=_float("RESEARCH_LAB_LOOP_START_FEE_USD", DEFAULT_LOOP_START_FEE_USD),
             allowed_research_islands=_normalized_csv("RESEARCH_LAB_ALLOWED_ISLANDS", "generalist"),
             internal_api_key=os.getenv("RESEARCH_LAB_INTERNAL_API_KEY", ""),
             hosted_worker_enabled=_truthy("RESEARCH_LAB_HOSTED_WORKER_ENABLED"),
             hosted_worker_poll_seconds=_int("RESEARCH_LAB_HOSTED_WORKER_POLL_SECONDS", 15),
             hosted_worker_max_runs=_int("RESEARCH_LAB_HOSTED_WORKER_MAX_RUNS", 0),
-            hosted_worker_max_candidates=max(1, _int("RESEARCH_LAB_HOSTED_WORKER_MAX_CANDIDATES", 3)),
+            hosted_worker_max_candidates=max(1, _int("RESEARCH_LAB_HOSTED_WORKER_MAX_CANDIDATES", 1)),
             hosted_worker_dry_run=_truthy("RESEARCH_LAB_HOSTED_WORKER_DRY_RUN", "false"),
             hosted_worker_id=os.getenv("RESEARCH_LAB_HOSTED_WORKER_ID", ""),
             hosted_worker_index=worker_index,
@@ -288,6 +316,10 @@ class ResearchLabGatewayConfig:
                 30,
                 _int("RESEARCH_LAB_SCORING_WORKER_MODEL_TIMEOUT_SECONDS", 900),
             ),
+            scoring_worker_max_claim_requeues=max(
+                1,
+                _int("RESEARCH_LAB_SCORING_WORKER_MAX_CLAIM_REQUEUES", 3),
+            ),
             private_model_docker_global_proxy_enabled=_truthy(
                 "RESEARCH_LAB_PRIVATE_MODEL_DOCKER_GLOBAL_PROXY_ENABLED",
                 "false",
@@ -301,9 +333,9 @@ class ResearchLabGatewayConfig:
                 prod_on,
             ),
             auto_research_min_seconds=max(0, _int("RESEARCH_LAB_AUTO_RESEARCH_MIN_SECONDS", 600)),
-            auto_research_max_seconds=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MAX_SECONDS", 1800)),
-            auto_research_min_iterations=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MIN_ITERATIONS", 2)),
-            auto_research_max_iterations=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MAX_ITERATIONS", 12)),
+            auto_research_max_seconds=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MAX_SECONDS", 2700)),
+            auto_research_min_iterations=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MIN_ITERATIONS", 3)),
+            auto_research_max_iterations=max(1, _int("RESEARCH_LAB_AUTO_RESEARCH_MAX_ITERATIONS", 6)),
             auto_research_draft_timeout_seconds=max(
                 10,
                 _int("RESEARCH_LAB_AUTO_RESEARCH_DRAFT_TIMEOUT_SECONDS", 90),
@@ -426,6 +458,14 @@ class ResearchLabGatewayConfig:
             private_build_cmd=os.getenv("RESEARCH_LAB_PRIVATE_BUILD_CMD", ""),
             private_artifact_manifest_output=os.getenv("RESEARCH_LAB_PRIVATE_ARTIFACT_MANIFEST_OUTPUT", ""),
             private_benchmark_path=os.getenv("RESEARCH_LAB_PRIVATE_BENCHMARK_PATH", ""),
+            code_edit_candidates_enabled=_truthy("RESEARCH_LAB_CODE_EDIT_CANDIDATES_ENABLED", "true"),
+            code_edit_build_timeout_seconds=max(
+                60,
+                _int("RESEARCH_LAB_CODE_EDIT_BUILD_TIMEOUT_SECONDS", 900),
+            ),
+            code_edit_allowed_paths_json=os.getenv("RESEARCH_LAB_CODE_EDIT_ALLOWED_PATHS_JSON", ""),
+            code_edit_allowed_exact_paths_json=os.getenv("RESEARCH_LAB_CODE_EDIT_ALLOWED_EXACT_PATHS_JSON", ""),
+            code_edit_allowed_suffixes_json=os.getenv("RESEARCH_LAB_CODE_EDIT_ALLOWED_SUFFIXES_JSON", ""),
             score_bundle_kms_key_id=os.getenv(
                 "RESEARCH_LAB_SCORE_BUNDLE_KMS_KEY_ID",
                 "alias/leadpoet-research-lab-artifact-signing",
@@ -515,6 +555,30 @@ class ResearchLabGatewayConfig:
                 if key in {"model", "max_candidates", "max_compute_budget_usd", "description"}
             }
         return tiers
+
+    def code_edit_allowed_path_prefixes(self) -> tuple[str, ...]:
+        from research_lab.code_editing import DEFAULT_ALLOWED_PATH_PREFIXES
+
+        return _tuple_from_json_or_csv(
+            self.code_edit_allowed_paths_json,
+            DEFAULT_ALLOWED_PATH_PREFIXES,
+        )
+
+    def code_edit_allowed_exact_paths(self) -> tuple[str, ...]:
+        from research_lab.code_editing import DEFAULT_ALLOWED_EXACT_PATHS
+
+        return _tuple_from_json_or_csv(
+            self.code_edit_allowed_exact_paths_json,
+            DEFAULT_ALLOWED_EXACT_PATHS,
+        )
+
+    def code_edit_allowed_suffixes(self) -> tuple[str, ...]:
+        from research_lab.code_editing import DEFAULT_ALLOWED_SUFFIXES
+
+        return _tuple_from_json_or_csv(
+            self.code_edit_allowed_suffixes_json,
+            DEFAULT_ALLOWED_SUFFIXES,
+        )
 
     def live_mutation_flags(self) -> dict[str, bool]:
         return {

@@ -17,11 +17,12 @@ from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
+from gateway.research_lab.code_build import CodeEditCandidateBuilder
+from gateway.research_lab.code_loop_engine import CodeEditLoopEngine
 from gateway.research_lab.config import DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS, ResearchLabGatewayConfig
 from gateway.research_lab.key_vault import OpenRouterKeyVaultError, decrypt_openrouter_key
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block, format_worker_line
 from gateway.research_lab.loop_engine import (
-    AutoResearchLoopEngine,
     AutoResearchLoopEvent,
     AutoResearchLoopSettings,
     OpenRouterCallResult,
@@ -53,7 +54,8 @@ from research_lab.reimbursements import (
     compute_participation_score,
     compute_reimbursement_award,
 )
-from research_lab.auto_research_prompt import build_validated_candidate_manifest, coerce_component_registry
+from research_lab.auto_research_prompt import coerce_component_registry
+from research_lab.canonical import sha256_json
 from research_lab.eval import (
     DockerPrivateModelRunner,
     DockerPrivateModelSpec,
@@ -335,6 +337,8 @@ class ResearchLabHostedWorker:
 
     async def run_once(self) -> HostedWorkerOutcome:
         self._require_enabled()
+        if not self.config.hosted_worker_dry_run:
+            await self._recover_stale_started_runs()
         if await is_autoresearch_maintenance_paused():
             return HostedWorkerOutcome(
                 processed=False,
@@ -342,7 +346,7 @@ class ResearchLabHostedWorker:
                 status="maintenance_paused",
             )
         if not self.config.hosted_worker_dry_run:
-            await self._recover_stale_started_runs()
+            await self._recover_stale_paused_runs()
         queued = await self._next_queued_run()
         if not queued:
             return HostedWorkerOutcome(processed=False, dry_run=self.config.hosted_worker_dry_run)
@@ -546,6 +550,63 @@ class ResearchLabHostedWorker:
             )
         return recovered
 
+    async def _recover_stale_paused_runs(self) -> int:
+        stale_after_seconds = max(
+            60,
+            int(self.config.active_loop_stale_after_seconds or DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS),
+        )
+        rows = await select_many(
+            "research_loop_run_queue_current",
+            columns=(
+                "run_id,ticket_id,current_queue_status,current_status_at,"
+                "current_event_hash,queue_priority,worker_ref"
+            ),
+            filters=(("current_queue_status", "paused"),),
+            order_by=(("current_status_at", True),),
+            limit=50,
+        )
+        recovered = 0
+        for row in rows:
+            if not _status_is_stale(row.get("current_status_at"), stale_after_seconds):
+                continue
+            run_id = str(row.get("run_id") or "")
+            ticket_id = str(row.get("ticket_id") or "")
+            if not run_id or not ticket_id:
+                continue
+            try:
+                await create_queue_event(
+                    run_id=run_id,
+                    ticket_id=ticket_id,
+                    event_type="queued",
+                    queue_priority=int(row.get("queue_priority") or 0),
+                    worker_ref=self.worker_ref,
+                    reason="stale_paused_requeued",
+                    event_doc={
+                        **autoresearch_queue_capacity_doc(self.config),
+                        "resume_source": "hosted_worker_stale_paused_reaper",
+                        "recovering_worker_ref": self.worker_ref,
+                        "previous_worker_ref": row.get("worker_ref"),
+                        "previous_event_hash": row.get("current_event_hash"),
+                        "previous_status_at": row.get("current_status_at"),
+                        "stale_after_seconds": stale_after_seconds,
+                    },
+                )
+                recovered += 1
+            except Exception as exc:
+                logger.warning(
+                    "research_lab_stale_paused_run_requeue_failed run_id=%s error=%s",
+                    compact_ref(run_id),
+                    str(exc)[:240],
+                )
+        if recovered:
+            logger.info(
+                "research_lab_stale_paused_runs_requeued worker_ref=%s count=%s stale_after_seconds=%s",
+                self.worker_ref,
+                recovered,
+                stale_after_seconds,
+            )
+        return recovered
+
     async def _load_run_context(self, queue_row: Mapping[str, Any]) -> HostedRunContext:
         ticket = await select_one(
             "research_loop_ticket_current",
@@ -586,8 +647,17 @@ class ResearchLabHostedWorker:
         )
 
     async def _process_run(self, context: HostedRunContext) -> HostedWorkerOutcome:
+        terminal = await self._already_completed_outcome(context)
+        if terminal:
+            return terminal
         await self._append_started_events(context)
+        completed_receipt_outcome = await self._complete_from_existing_completed_receipt(context)
+        if completed_receipt_outcome:
+            return completed_receipt_outcome
         context.receipt_id = await self._ensure_queued_receipt(context)
+        existing_candidate_outcome = await self._complete_from_existing_candidate_artifacts(context)
+        if existing_candidate_outcome:
+            return existing_candidate_outcome
         if await is_autoresearch_maintenance_paused():
             return await self._mark_paused(
                 context,
@@ -703,29 +773,40 @@ class ResearchLabHostedWorker:
                     max_tokens=max_tokens,
                 )
 
-            loop_result = await AutoResearchLoopEngine(
-                settings=AutoResearchLoopSettings(
-                    min_seconds=self.config.auto_research_min_seconds,
-                    max_seconds=self.config.auto_research_max_seconds,
-                    min_iterations=self.config.auto_research_min_iterations,
-                    max_iterations=self.config.auto_research_max_iterations,
-                    draft_timeout_seconds=self.config.auto_research_draft_timeout_seconds,
-                    reflection_timeout_seconds=self.config.auto_research_reflection_timeout_seconds,
-                    estimated_iteration_cost_usd=self.config.auto_research_estimated_iteration_cost_usd,
-                    max_candidates=max_candidates,
-                ),
+            loop_settings = AutoResearchLoopSettings(
+                min_seconds=self.config.auto_research_min_seconds,
+                max_seconds=self.config.auto_research_max_seconds,
+                min_iterations=self.config.auto_research_min_iterations,
+                max_iterations=self.config.auto_research_max_iterations,
+                draft_timeout_seconds=self.config.auto_research_draft_timeout_seconds,
+                reflection_timeout_seconds=self.config.auto_research_reflection_timeout_seconds,
+                estimated_iteration_cost_usd=self.config.auto_research_estimated_iteration_cost_usd,
+                max_candidates=max_candidates,
+            )
+            code_builder = CodeEditCandidateBuilder(self.config)
+            if not self.config.code_edit_candidates_enabled:
+                raise HostedResearchLabWorkerError(
+                    "code-edit image-build candidates are required; RESEARCH_LAB_CODE_EDIT_CANDIDATES_ENABLED is false"
+                )
+            if not code_builder.enabled():
+                raise HostedResearchLabWorkerError(
+                    "code-edit image-build candidates are required but the gateway builder is not configured"
+                )
+
+            loop_result = await CodeEditLoopEngine(
+                settings=loop_settings,
                 call_openrouter=_call_loop_model,
                 event_sink=_record_loop_event,
+                builder=code_builder,
             ).run(
                 run_id=context.run_id,
                 ticket=context.ticket,
                 artifact=artifact,
-                component_registry=registry,
+                component_registry=registry.to_dict(),
                 benchmark_public_summary=benchmark_public_summary,
                 model_id=model_id,
                 budget_context=budget_context,
                 requested_loop_count=int(context.ticket.get("requested_loop_count") or 1),
-                miner_brief_ref=str(context.ticket.get("brief_sanitized_ref") or ""),
                 resume_state=resume_state,
                 should_pause=is_autoresearch_maintenance_paused,
             )
@@ -737,101 +818,91 @@ class ResearchLabHostedWorker:
                     reason="maintenance_pause_checkpointed",
                 )
             if not loop_result.selected_candidates:
-                raise HostedResearchLabWorkerError("auto-research loop completed without valid candidate finalists")
-
-            active_finish = await load_active_private_model(self.config, register_bootstrap=True)
+                raise HostedResearchLabWorkerError("auto-research loop completed without valid image-build finalists")
             final_artifact = artifact
-            finalists: list[dict[str, Any]] = [
+            finalists = [
                 {
+                    "candidate_kind": "image_build",
                     "selected": candidate,
-                    "patch_manifest": candidate.patch_manifest,
-                    "hypothesis": candidate.hypothesis,
-                    "patch": candidate.patch,
+                    "candidate_patch_manifest": candidate.build.code_edit_manifest,
+                    "candidate_model_manifest": candidate.build.candidate_model_manifest.to_dict(),
+                    "candidate_source_diff_hash": candidate.build.source_diff_hash,
+                    "candidate_build_doc": candidate.build.build_doc,
+                    "hypothesis_doc": {
+                        "failure_mode": candidate.draft.failure_mode,
+                        "mechanism": candidate.draft.mechanism,
+                        "expected_improvement": candidate.draft.expected_improvement,
+                        "risk": candidate.draft.risk,
+                        "focus_alignment": f"code_edit_lane:{candidate.draft.lane}",
+                        "predicted_delta": candidate.draft.predicted_delta,
+                        "falsifier": "official_scoring",
+                    },
+                    "patch_doc": {
+                        "code_edit": {
+                            "lane": candidate.draft.lane,
+                            "target_files": list(candidate.draft.target_files),
+                            "unified_diff_hash": sha256_json({"unified_diff": candidate.draft.unified_diff}),
+                            "redacted_summary": candidate.draft.redacted_summary,
+                            "test_plan": candidate.draft.test_plan,
+                            "rollback_plan": candidate.draft.rollback_plan,
+                        }
+                    },
                     "iteration": candidate.iteration,
                     "node_id": candidate.node_id,
+                    "redacted_public_summary": candidate.draft.redacted_summary,
                 }
                 for candidate in loop_result.selected_candidates
             ]
-            if active_finish.artifact.model_artifact_hash != artifact.model_artifact_hash:
-                final_artifact = active_finish.artifact
-                latest_runner = DockerPrivateModelRunner(
-                    DockerPrivateModelSpec(
-                        image_digest=final_artifact.image_digest,
-                        env_passthrough=_private_model_env_passthrough(self.config),
-                        extra_env=docker_provider_env,
-                        timeout_seconds=900,
-                    )
-                )
-                latest_registry = coerce_component_registry(latest_runner.metadata())
-                rebuilt: list[dict[str, Any]] = []
-                for index, candidate in enumerate(loop_result.selected_candidates):
-                    try:
-                        patch_manifest, hypothesis, patch = build_validated_candidate_manifest(
-                            draft=candidate.draft,
-                            artifact_manifest=final_artifact,
-                            component_registry=latest_registry,
-                            run_id=context.run_id,
-                            sequence=(candidate.iteration * 1000) + index,
-                            miner_brief_ref=str(context.ticket.get("brief_sanitized_ref") or ""),
-                        )
-                    except Exception as exc:
-                        logger.warning(
-                            "Research Lab finalist dropped during active-parent refresh: run_id=%s node=%s error=%s",
-                            context.run_id,
-                            candidate.node_id,
-                            str(exc)[:200],
-                        )
-                        continue
-                    rebuilt.append(
-                        {
-                            "selected": candidate,
-                            "patch_manifest": patch_manifest,
-                            "hypothesis": hypothesis,
-                            "patch": patch,
-                            "iteration": candidate.iteration,
-                            "node_id": candidate.node_id,
-                        }
-                    )
-                if not rebuilt:
-                    raise HostedResearchLabWorkerError("active model changed and no finalist rebased cleanly")
-                finalists = rebuilt
-                logger.info(
-                    "Research Lab finalists rebased to latest active artifact: run_id=%s old_parent=%s new_parent=%s count=%s",
-                    context.run_id,
-                    artifact.model_artifact_hash,
-                    final_artifact.model_artifact_hash,
-                    len(finalists),
-                )
 
         candidate_ids: list[str] = []
         candidate_summaries: list[dict[str, Any]] = []
         for index, finalist in enumerate(finalists):
-            patch_manifest = finalist["patch_manifest"]
-            hypothesis = finalist["hypothesis"]
-            patch = finalist["patch"]
+            candidate_kind = str(finalist.get("candidate_kind") or "image_build")
+            if candidate_kind != "image_build":
+                raise HostedResearchLabWorkerError("hosted auto-research produced a non-image-build candidate")
+            candidate_patch_manifest = dict(finalist["candidate_patch_manifest"])
+            hypothesis_doc = dict(finalist.get("hypothesis_doc") or {})
+            patch_doc = dict(finalist.get("patch_doc") or {})
+            redacted_summary = str(finalist.get("redacted_public_summary") or "")
+            candidate_artifact_hash = str(candidate_patch_manifest["candidate_artifact_hash"])
+            candidate_patch_hash = sha256_json(candidate_patch_manifest)
             request = ResearchLabCandidateArtifactCreateRequest(
                 run_id=context.run_id,
                 ticket_id=context.ticket_id,
                 receipt_id=context.receipt_id,
                 miner_hotkey=str(context.ticket["miner_hotkey"]),
                 island=str(context.ticket["island"]),
+                candidate_kind=candidate_kind,
                 private_model_manifest=final_artifact.to_dict(),
-                candidate_patch_manifest=patch_manifest.to_dict(),
-                hypothesis_doc=hypothesis.to_dict(),
-                redacted_public_summary=patch_manifest.redacted_summary,
+                candidate_patch_manifest=candidate_patch_manifest,
+                candidate_model_manifest=finalist.get("candidate_model_manifest"),
+                candidate_source_diff_hash=finalist.get("candidate_source_diff_hash"),
+                candidate_build_doc=dict(finalist.get("candidate_build_doc") or {}),
+                hypothesis_doc=hypothesis_doc,
+                redacted_public_summary=redacted_summary,
             )
-            candidate_row, _candidate_event = await create_candidate_artifact(request)
+            candidate_row, _candidate_event = await self._store_write_with_retry(
+                "candidate_artifact_create",
+                lambda request=request: create_candidate_artifact(request),
+            )
             candidate_ids.append(str(candidate_row["candidate_id"]))
             candidate_summaries.append(
                 {
                     "candidate_index": index,
+                    "candidate_kind": candidate_kind,
                     "loop_iteration": finalist["iteration"],
                     "loop_node_id": finalist["node_id"],
                     "candidate_id": str(candidate_row["candidate_id"]),
-                    "candidate_artifact_hash": patch_manifest.candidate_artifact_hash,
-                    "candidate_patch_hash": patch_manifest.manifest_hash(),
-                    "hypothesis": hypothesis.to_dict(),
-                    "patch": patch.to_dict(),
+                    "candidate_artifact_hash": candidate_artifact_hash,
+                    "candidate_patch_hash": candidate_patch_hash,
+                    "candidate_model_manifest_hash": (
+                        (finalist.get("candidate_model_manifest") or {}).get("manifest_hash")
+                        if isinstance(finalist.get("candidate_model_manifest"), Mapping)
+                        else None
+                    ),
+                    "candidate_source_diff_hash": finalist.get("candidate_source_diff_hash"),
+                    "hypothesis": hypothesis_doc,
+                    "patch": patch_doc,
                     "parent_artifact_hash": final_artifact.model_artifact_hash,
                 }
             )
@@ -867,14 +938,17 @@ class ResearchLabHostedWorker:
             "next_stage": "gateway_qualification_worker_evaluation",
         }
         try:
-            await create_queue_event(
-                run_id=context.run_id,
-                ticket_id=context.ticket_id,
-                event_type="completed",
-                queue_priority=int(context.queue_row.get("queue_priority") or 0),
-                worker_ref=self.worker_ref,
-                reason="candidate_generation_completed_evaluation_queued",
-                event_doc=completion_queue_doc,
+            await self._store_write_with_retry(
+                "completion_queue_event",
+                lambda: create_queue_event(
+                    run_id=context.run_id,
+                    ticket_id=context.ticket_id,
+                    event_type="completed",
+                    queue_priority=int(context.queue_row.get("queue_priority") or 0),
+                    worker_ref=self.worker_ref,
+                    reason="candidate_generation_completed_evaluation_queued",
+                    event_doc=completion_queue_doc,
+                ),
             )
         except Exception:
             current_after_completion = await select_one(
@@ -890,12 +964,15 @@ class ResearchLabHostedWorker:
                 current_after_completion.get("current_event_hash"),
             )
         try:
-            await create_receipt_event(
-                receipt_id=str(context.receipt_id),
-                ticket_id=context.ticket_id,
-                event_type="completed",
-                receipt_status="completed",
-                event_doc=completion_receipt_doc,
+            await self._store_write_with_retry(
+                "completion_receipt_event",
+                lambda: create_receipt_event(
+                    receipt_id=str(context.receipt_id),
+                    ticket_id=context.ticket_id,
+                    event_type="completed",
+                    receipt_status="completed",
+                    event_doc=completion_receipt_doc,
+                ),
             )
         except Exception as exc:
             logger.warning(
@@ -958,6 +1035,153 @@ class ResearchLabHostedWorker:
             receipt_id=context.receipt_id,
             candidate_ids=tuple(candidate_ids),
         )
+
+    async def _store_write_with_retry(self, label: str, operation: Any, *, attempts: int = 3) -> Any:
+        last_exc: BaseException | None = None
+        for attempt in range(1, max(1, attempts) + 1):
+            try:
+                return await operation()
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts or not _is_retryable_worker_exception(exc):
+                    raise
+                logger.warning(
+                    "research_lab_store_write_retry label=%s run_attempt=%s/%s error=%s",
+                    label,
+                    attempt,
+                    attempts,
+                    str(exc)[:240],
+                )
+                await asyncio.sleep(0.25 * attempt)
+        raise RuntimeError(f"Research Lab store write failed after retries: {label}") from last_exc
+
+    async def _already_completed_outcome(self, context: HostedRunContext) -> HostedWorkerOutcome | None:
+        current = await select_one(
+            "research_loop_run_queue_current",
+            filters=(("run_id", context.run_id),),
+        )
+        if current and str(current.get("current_queue_status") or "") == "completed":
+            candidate_ids = await self._candidate_ids_for_run(context.run_id)
+            receipt_id = await self._receipt_id_for_run(context.run_id)
+            return HostedWorkerOutcome(
+                processed=False,
+                dry_run=False,
+                run_id=context.run_id,
+                ticket_id=context.ticket_id,
+                status="already_completed",
+                receipt_id=receipt_id,
+                candidate_ids=tuple(candidate_ids),
+            )
+        return None
+
+    async def _complete_from_existing_completed_receipt(self, context: HostedRunContext) -> HostedWorkerOutcome | None:
+        receipt_id = await self._completed_receipt_id_for_run(context.run_id)
+        if not receipt_id:
+            return None
+        candidate_ids = await self._candidate_ids_for_run(context.run_id)
+        event_doc = {
+            "receipt_id": receipt_id,
+            "candidate_ids": candidate_ids,
+            "candidate_count": len(candidate_ids),
+            "source": "existing_completed_receipt_after_recovery",
+        }
+        await create_queue_event(
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            event_type="completed",
+            queue_priority=int(context.queue_row.get("queue_priority") or 0),
+            worker_ref=self.worker_ref,
+            reason="candidate_generation_completed_from_existing_receipt",
+            event_doc=event_doc,
+        )
+        return HostedWorkerOutcome(
+            processed=True,
+            dry_run=False,
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            status="candidate_generation_completed_from_existing_receipt",
+            receipt_id=receipt_id,
+            candidate_ids=tuple(candidate_ids),
+        )
+
+    async def _complete_from_existing_candidate_artifacts(self, context: HostedRunContext) -> HostedWorkerOutcome | None:
+        candidate_ids = await self._candidate_ids_for_run(context.run_id)
+        if not candidate_ids:
+            return None
+        receipt_id = context.receipt_id or await self._ensure_queued_receipt(context)
+        context.receipt_id = receipt_id
+        event_doc = {
+            "receipt_id": receipt_id,
+            "candidate_ids": candidate_ids,
+            "candidate_count": len(candidate_ids),
+            "source": "existing_candidate_artifacts_after_recovery",
+            "next_stage": "gateway_qualification_worker_evaluation",
+        }
+        await create_queue_event(
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            event_type="completed",
+            queue_priority=int(context.queue_row.get("queue_priority") or 0),
+            worker_ref=self.worker_ref,
+            reason="candidate_generation_completed_from_existing_artifacts",
+            event_doc=event_doc,
+        )
+        try:
+            await create_receipt_event(
+                receipt_id=receipt_id,
+                ticket_id=context.ticket_id,
+                event_type="completed",
+                receipt_status="completed",
+                event_doc=event_doc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "research_lab_existing_candidate_receipt_completion_failed run_id=%s receipt_id=%s error=%s",
+                compact_ref(context.run_id),
+                compact_ref(receipt_id),
+                str(exc)[:240],
+            )
+        return HostedWorkerOutcome(
+            processed=True,
+            dry_run=False,
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            status="candidate_generation_completed_from_existing_artifacts",
+            receipt_id=receipt_id,
+            candidate_ids=tuple(candidate_ids),
+        )
+
+    async def _candidate_ids_for_run(self, run_id: str) -> list[str]:
+        rows = await select_many(
+            "research_lab_candidate_artifacts",
+            columns="candidate_id",
+            filters=(("run_id", run_id),),
+            limit=max(10, int(self.config.hosted_worker_max_candidates or 1) * 5),
+        )
+        return [str(row["candidate_id"]) for row in rows if row.get("candidate_id")]
+
+    async def _receipt_id_for_run(self, run_id: str) -> str | None:
+        rows = await select_many(
+            "research_loop_receipt_current",
+            columns="receipt_id,current_receipt_status",
+            filters=(("run_id", run_id),),
+            order_by=(("current_status_at", True),),
+            limit=10,
+        )
+        return str(rows[0]["receipt_id"]) if rows else None
+
+    async def _completed_receipt_id_for_run(self, run_id: str) -> str | None:
+        rows = await select_many(
+            "research_loop_receipt_current",
+            columns="receipt_id,current_receipt_status",
+            filters=(("run_id", run_id),),
+            order_by=(("current_status_at", True),),
+            limit=10,
+        )
+        for row in rows:
+            if str(row.get("current_receipt_status") or "") == "completed":
+                return str(row["receipt_id"])
+        return None
 
     async def _ensure_queued_receipt(self, context: HostedRunContext) -> str:
         if context.receipt_id:
