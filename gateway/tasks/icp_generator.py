@@ -26,6 +26,8 @@ target_seniority — anything role-shaped is legacy from the contact-mode
 era and is intentionally absent from generated sets.
 """
 
+from __future__ import annotations
+
 import os
 import json
 import time
@@ -37,6 +39,13 @@ import httpx
 from datetime import datetime, timezone, timedelta
 from typing import List, Dict, Any, Optional
 from uuid import uuid4
+
+from research_lab.employee_buckets import (
+    DEFAULT_EMPLOYEE_BUCKET_RADIUS,
+    GENERATED_EMPLOYEE_BUCKETS,
+    normalize_employee_count_bucket,
+    normalize_employee_count_buckets,
+)
 
 import pytz
 
@@ -187,47 +196,8 @@ SUB_INDUSTRIES = {
     ],
 }
 
-# Company sizes
-# Keep these exact. They mirror LinkedIn company employee bands and the
-# validator's hard-gate vocabulary; off-by-one legacy buckets like "200-500"
-# cause exact-band private model matches to fail.
-LINKEDIN_EMPLOYEE_BUCKETS = [
-    "0-1",
-    "2-10",
-    "11-50",
-    "51-200",
-    "201-500",
-    "501-1,000",
-    "1,001-5,000",
-    "5,001-10,000",
-    "10,001+",
-]
-
 # Avoid tiny buckets in generated ICPs unless explicitly introduced later.
-COMPANY_SIZES = [
-    "11-50",
-    "51-200",
-    "201-500",
-    "501-1,000",
-    "1,001-5,000",
-    "5,001-10,000",
-    "10,001+",
-]
-
-LEGACY_EMPLOYEE_BUCKET_MAP = {
-    "10-50": "11-50",
-    "50-200": "51-200",
-    "200-500": "201-500",
-    "500-1000": "501-1,000",
-    "501-1000": "501-1,000",
-    "1000-5000": "1,001-5,000",
-    "1001-5000": "1,001-5,000",
-    "5000-10000": "5,001-10,000",
-    "5001-10000": "5,001-10,000",
-    "5000+": "5,001-10,000",
-    "10000+": "10,001+",
-    "10001+": "10,001+",
-}
+COMPANY_SIZES = list(GENERATED_EMPLOYEE_BUCKETS[1:])
 
 # Company stages
 COMPANY_STAGES = [
@@ -450,19 +420,6 @@ INTENT_CATEGORY_MAX_AGE_DAYS = {
 }
 
 
-def normalize_employee_count_bucket(value: Any, *, default: str = "51-200") -> str:
-    """Normalize generated ICP size bands to exact LinkedIn employee buckets."""
-
-    raw = " ".join(str(value or "").strip().split())
-    if raw in LINKEDIN_EMPLOYEE_BUCKETS:
-        return raw
-    key = raw.replace(",", "")
-    normalized = LEGACY_EMPLOYEE_BUCKET_MAP.get(key) or LEGACY_EMPLOYEE_BUCKET_MAP.get(raw)
-    if normalized:
-        return normalized
-    return default
-
-
 def intent_category_for_signal(signal: Any) -> str:
     text = " ".join(str(signal or "").strip().split())
     if text in INTENT_SIGNAL_CATEGORY_MAP:
@@ -520,15 +477,54 @@ def _required_attribute_for_icp(icp: Dict[str, Any], *, industry: str, sub_indus
     return f"The company operates in {industry}" if industry else "The company matches the target customer profile"
 
 
-def canonicalize_generated_icp(icp: Dict[str, Any], *, industry: str, sub_industry: str) -> Dict[str, Any]:
+def _configured_employee_bucket_radius() -> int:
+    try:
+        return max(0, int(os.getenv("RESEARCH_LAB_ICP_EMPLOYEE_BUCKET_RADIUS", str(DEFAULT_EMPLOYEE_BUCKET_RADIUS))))
+    except ValueError:
+        logger.warning(
+            "invalid RESEARCH_LAB_ICP_EMPLOYEE_BUCKET_RADIUS=%r; using default radius %s",
+            os.getenv("RESEARCH_LAB_ICP_EMPLOYEE_BUCKET_RADIUS"),
+            DEFAULT_EMPLOYEE_BUCKET_RADIUS,
+        )
+        return DEFAULT_EMPLOYEE_BUCKET_RADIUS
+
+
+def _configured_employee_all_buckets() -> bool:
+    return os.getenv("RESEARCH_LAB_ICP_EMPLOYEE_ALL_BUCKETS", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _employee_count_display(value: Any) -> str:
+    if isinstance(value, list):
+        return ", ".join(str(item) for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def canonicalize_generated_icp(
+    icp: Dict[str, Any],
+    *,
+    industry: str,
+    sub_industry: str,
+    employee_bucket_radius: int | None = None,
+    all_employee_buckets: bool | None = None,
+) -> Dict[str, Any]:
     """Apply the private sourcing-model ICP contract before storage."""
 
     normalized = dict(icp)
     raw_employee_count = normalized.get("employee_count")
     employee_count = normalize_employee_count_bucket(raw_employee_count)
+    allowed_employee_counts = normalize_employee_count_buckets(
+        normalized.get("employee_count_buckets")
+        or normalized.get("employee_counts")
+        or raw_employee_count,
+        primary_bucket=employee_count,
+        radius=_configured_employee_bucket_radius() if employee_bucket_radius is None else employee_bucket_radius,
+        all_buckets=_configured_employee_all_buckets() if all_employee_buckets is None else all_employee_buckets,
+    )
     prompt = str(normalized.get("prompt") or "")
-    if raw_employee_count and str(raw_employee_count) != employee_count:
-        prompt = prompt.replace(str(raw_employee_count), employee_count)
+    if raw_employee_count and isinstance(raw_employee_count, str):
+        prompt = prompt.replace(str(raw_employee_count), _employee_count_display(allowed_employee_counts))
+    elif raw_employee_count and employee_count:
+        prompt = prompt.replace(employee_count, _employee_count_display(allowed_employee_counts))
 
     intent_signals = _normalize_intent_signals(normalized.get("intent_signals"))
     explicit_required = " ".join(str(normalized.get("intent_signal") or "").strip().split())
@@ -563,7 +559,7 @@ def canonicalize_generated_icp(icp: Dict[str, Any], *, industry: str, sub_indust
     normalized.update(
         {
             "prompt": prompt,
-            "employee_count": employee_count,
+            "employee_count": allowed_employee_counts,
             "intent_signals": intent_signals,
             "intent_signal": intent_signal,
             "intent_category": intent_category,
@@ -576,6 +572,8 @@ def canonicalize_generated_icp(icp: Dict[str, Any], *, industry: str, sub_indust
             ),
         }
     )
+    normalized.pop("employee_count_buckets", None)
+    normalized.pop("employee_counts", None)
     return normalized
 
 
@@ -691,7 +689,9 @@ Do NOT cluster on later stages just because they're easier to verify. The realis
 
 ALLOWED EMPLOYEE BANDS — USE THESE EXACT LINKEDIN BUCKETS ONLY:
 11-50, 51-200, 201-500, 501-1,000, 1,001-5,000, 5,001-10,000, 10,001+
-(Prefer 51-200, 201-500, or 501-1,000 for broader coverage.)
+- `employee_count` must be a JSON array of the allowed LinkedIn buckets.
+- Prefer 3-5 contiguous buckets around the most realistic target size.
+- Do not use fake broad ranges like "51-5000".
 
 ALLOWED GEOGRAPHIES — STRONGLY PREFER BROAD VALUES:
 - "United States" (whole country — use this for ~50% of ICPs)
@@ -723,7 +723,7 @@ OUTPUT — JSON ONLY, NO PROSE, NO MARKDOWN
       "sub_industry": "<natural sub-industry>",
       "geography": "<from allowed geographies, prefer broad>",
       "country": "United States",
-      "employee_count": "<from allowed LinkedIn bands>",
+      "employee_count": ["<3-5 contiguous allowed LinkedIn buckets>"],
       "company_stage": "<from allowed stages>",
       "product_service": "<broad category — NOT a single named tool>",
       "required_attribute": "The company offers or provides <product_service or broad category>",
