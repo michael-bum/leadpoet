@@ -19,9 +19,10 @@ DECLARE
     capacity INTEGER;
     stale_after_seconds INTEGER;
     cutoff TIMESTAMPTZ;
-    miner_hotkey TEXT;
+    v_miner_hotkey TEXT;
     active_count INTEGER;
     same_hotkey_count INTEGER;
+    is_existing_run_requeue BOOLEAN;
 BEGIN
     IF NEW.event_type <> 'queued' THEN
         RETURN NEW;
@@ -38,9 +39,9 @@ BEGIN
             USING ERRCODE = '23505';
     END IF;
 
-    stale_text := COALESCE(NEW.event_doc->>'active_loop_stale_after_seconds', '7200');
+    stale_text := COALESCE(NEW.event_doc->>'active_loop_stale_after_seconds', '300');
     IF stale_text !~ '^[0-9]+$' THEN
-        stale_text := '7200';
+        stale_text := '300';
     END IF;
 
     capacity := capacity_text::INTEGER;
@@ -55,17 +56,21 @@ BEGIN
     END IF;
 
     SELECT t.miner_hotkey
-      INTO miner_hotkey
+      INTO v_miner_hotkey
       FROM public.research_loop_tickets t
      WHERE t.ticket_id = NEW.ticket_id
      LIMIT 1;
 
-    IF miner_hotkey IS NULL OR btrim(miner_hotkey) = '' THEN
+    IF v_miner_hotkey IS NULL OR btrim(v_miner_hotkey) = '' THEN
         RAISE EXCEPTION
             'research_lab_queue_capacity_conflict: missing miner hotkey for run %',
             NEW.run_id
             USING ERRCODE = '23505';
     END IF;
+
+    is_existing_run_requeue :=
+        (NEW.event_doc ? 'resume_source')
+        OR (NEW.event_doc ? 'recovering_worker_ref');
 
     PERFORM pg_catalog.pg_advisory_xact_lock(
         pg_catalog.hashtext('research_lab_queue_capacity'),
@@ -76,22 +81,34 @@ BEGIN
       INTO same_hotkey_count
       FROM public.research_loop_run_queue_current q
       JOIN public.research_loop_tickets t ON t.ticket_id = q.ticket_id
-     WHERE q.current_queue_status IN ('queued', 'started')
-       AND q.current_status_at >= cutoff
-       AND btrim(t.miner_hotkey) = btrim(miner_hotkey);
+     WHERE q.run_id <> NEW.run_id
+       AND q.current_queue_status IN ('queued', 'started', 'paused')
+       AND (q.current_queue_status = 'paused' OR q.current_status_at >= cutoff)
+       AND btrim(t.miner_hotkey) = btrim(v_miner_hotkey);
 
     IF same_hotkey_count > 0 THEN
         RAISE EXCEPTION
             'research_lab_queue_hotkey_conflict: miner % already has active run',
-            miner_hotkey
+            v_miner_hotkey
             USING ERRCODE = '23505';
     END IF;
 
     SELECT COUNT(*)
       INTO active_count
       FROM public.research_loop_run_queue_current q
-     WHERE q.current_queue_status IN ('queued', 'started')
-       AND q.current_status_at >= cutoff;
+     WHERE q.run_id <> NEW.run_id
+       AND (
+           (
+             is_existing_run_requeue
+             AND q.current_queue_status IN ('queued', 'started')
+             AND q.current_status_at >= cutoff
+           )
+           OR (
+             NOT is_existing_run_requeue
+             AND q.current_queue_status IN ('queued', 'started', 'paused')
+             AND (q.current_queue_status = 'paused' OR q.current_status_at >= cutoff)
+           )
+       );
 
     IF active_count >= capacity THEN
         RAISE EXCEPTION

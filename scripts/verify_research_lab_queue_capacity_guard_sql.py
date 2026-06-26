@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -20,14 +21,21 @@ def main() -> int:
         "research_lab_queue_capacity_conflict",
         "research_lab_queue_hotkey_conflict",
         "pg_advisory_xact_lock",
-        "current_queue_status IN ('queued', 'started')",
+        "current_queue_status IN ('queued', 'started', 'paused')",
+        "is_existing_run_requeue BOOLEAN",
+        "q.run_id <> NEW.run_id",
+        "NEW.event_doc ? 'resume_source'",
+        "q.current_queue_status IN ('queued', 'started')",
+        "(q.current_queue_status = 'paused' OR q.current_status_at >= cutoff)",
         "NEW.event_doc->>'autoresearch_capacity'",
+        "v_miner_hotkey TEXT",
+        "btrim(v_miner_hotkey)",
     }
     required_api = {
         "_queue_capacity_doc(config)",
         '"autoresearch_capacity_policy": "proxy_worker_capacity:v1"',
         '"autoresearch_capacity": int(_autoresearch_loop_capacity(config))',
-        '"active_loop_stale_after_seconds": max(60, int(config.active_loop_stale_after_seconds or 7200))',
+        "DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS",
         "research_lab_queue_capacity_conflict",
         "research_lab_queue_hotkey_conflict",
     }
@@ -36,6 +44,9 @@ def main() -> int:
     if missing:
         for marker in missing:
             print(f"missing queue capacity guard marker: {marker}")
+        return 1
+    if re.search(r"(?m)^\s+miner_hotkey\s+TEXT;", sql):
+        print("ambiguous PL/pgSQL variable name remains: miner_hotkey TEXT")
         return 1
     print("Research Lab queue capacity guard verifier passed")
     return 0

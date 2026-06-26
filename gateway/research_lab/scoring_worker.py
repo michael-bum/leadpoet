@@ -55,6 +55,7 @@ from research_lab.eval import (
     SealedBenchmarkSet,
     evaluate_private_model_pair,
     ensure_private_model_outputs,
+    private_model_env_passthrough,
     sign_digest_with_kms,
 )
 from research_lab.eval.evaluator import QualificationStyleCompanyScorer
@@ -81,6 +82,39 @@ def _error_backoff_seconds() -> float:
 
 def _short_error(exc: BaseException) -> str:
     return f"{exc.__class__.__name__}: {str(exc)[:300]}"
+
+
+def _runtime_error_diagnostics(error_text: str) -> dict[str, Any]:
+    """Return DB-safe runtime diagnostics without provider URLs or request text."""
+
+    lowered = error_text.lower()
+    provider = "unknown"
+    if "scrapingdog" in lowered:
+        provider = "scrapingdog"
+    elif "exa" in lowered:
+        provider = "exa"
+    elif "openrouter" in lowered:
+        provider = "openrouter"
+
+    status = 0
+    for code in (400, 401, 403, 404, 408, 409, 429, 500, 502, 503, 504):
+        if f"http error {code}" in lowered or f"status={code}" in lowered or f'"status":{code}' in lowered:
+            status = code
+            break
+
+    if status >= 500:
+        category = "provider_http_5xx"
+    elif status >= 400:
+        category = "provider_http_4xx"
+    else:
+        category = "runtime_provider_error"
+
+    return {
+        "error_class": "PrivateModelRuntimeError" if "privatemodelruntimeerror" in lowered else "RuntimeError",
+        "provider": provider,
+        "status": status,
+        "category": category,
+    }
 
 
 def _status_age_seconds(raw_status_at: object) -> float | None:
@@ -357,6 +391,8 @@ class ResearchLabGatewayScoringWorker:
     async def _score_candidate(self, candidate: Mapping[str, Any]) -> None:
         candidate_id = str(candidate["candidate_id"])
         start = time.time()
+        scored_event_written = False
+        scored_score_bundle_id = ""
         try:
             evaluation_epoch = await self._resolve_evaluation_epoch()
             stale_result = await self._maybe_rebase_stale_candidate_before_scoring(
@@ -443,6 +479,7 @@ class ResearchLabGatewayScoringWorker:
                 DockerPrivateModelSpec(
                     image_digest=artifact.image_digest,
                     timeout_seconds=self.config.scoring_worker_model_timeout_seconds,
+                    env_passthrough=self._private_model_env_passthrough(),
                     extra_env=self._private_scoring_env(),
                 )
             )
@@ -475,6 +512,7 @@ class ResearchLabGatewayScoringWorker:
                 score_bundle=score_bundle,
             )
             bundle, _bundle_event = await create_score_bundle(score_bundle_request)
+            scored_score_bundle_id = str(bundle["score_bundle_id"])
             await create_candidate_evaluation_event(
                 candidate_id=candidate_id,
                 run_id=str(candidate["run_id"]),
@@ -483,7 +521,7 @@ class ResearchLabGatewayScoringWorker:
                 candidate_status="scored",
                 evaluator_ref=self.worker_ref,
                 reason="gateway_qualification_worker_scored_candidate",
-                score_bundle_id=str(bundle["score_bundle_id"]),
+                score_bundle_id=scored_score_bundle_id,
                 event_doc={
                     "score_bundle_hash": score_bundle["score_bundle_hash"],
                     "rolling_window_hash": window.window_hash,
@@ -492,6 +530,7 @@ class ResearchLabGatewayScoringWorker:
                     "proxy_ref_hash": self.proxy_ref_hash,
                 },
             )
+            scored_event_written = True
             await create_scoring_dispatch_event(
                 dispatch_type="candidate_scoring",
                 dispatch_status="scored",
@@ -532,6 +571,15 @@ class ResearchLabGatewayScoringWorker:
                 )
             )
         except Exception as exc:
+            if scored_event_written:
+                await self._record_scored_candidate_side_effect_failure(
+                    candidate=candidate,
+                    candidate_id=candidate_id,
+                    score_bundle_id=scored_score_bundle_id,
+                    error=exc,
+                    elapsed_seconds=round(time.time() - start, 3),
+                )
+                return
             await create_candidate_evaluation_event(
                 candidate_id=candidate_id,
                 run_id=str(candidate["run_id"]),
@@ -581,6 +629,51 @@ class ResearchLabGatewayScoringWorker:
                 )
             )
 
+    async def _record_scored_candidate_side_effect_failure(
+        self,
+        *,
+        candidate: Mapping[str, Any],
+        candidate_id: str,
+        score_bundle_id: str,
+        error: BaseException,
+        elapsed_seconds: float,
+    ) -> None:
+        event_doc = {
+            "error": str(error)[:500],
+            "elapsed_seconds": elapsed_seconds,
+            "worker_ref": self.worker_ref,
+            "proxy_ref_hash": self.proxy_ref_hash,
+            "score_bundle_id": score_bundle_id,
+            "candidate_status_preserved": "scored",
+        }
+        try:
+            await create_scoring_dispatch_event(
+                dispatch_type="candidate_scoring_side_effect",
+                dispatch_status="failed",
+                worker_ref=self.worker_ref,
+                proxy_ref_hash=self.proxy_ref_hash,
+                candidate_id=candidate_id,
+                run_id=str(candidate["run_id"]),
+                ticket_id=str(candidate["ticket_id"]),
+                score_bundle_id=score_bundle_id or None,
+                event_doc=event_doc,
+            )
+        except Exception:
+            logger.exception("research_lab_scored_candidate_side_effect_dispatch_failed")
+        logger.exception(
+            format_worker_block(
+                "RESEARCH LAB CANDIDATE POST-SCORE SIDE EFFECT FAILED",
+                (
+                    ("Worker", self.worker_ref),
+                    ("Candidate", compact_ref(candidate_id)),
+                    ("Run", compact_ref(candidate.get("run_id"))),
+                    ("Score bundle", compact_ref(score_bundle_id)),
+                    ("Error", str(error)[:300]),
+                    ("Candidate state", "scored"),
+                ),
+            )
+        )
+
     async def _maybe_promote_scored_candidate(
         self,
         *,
@@ -598,6 +691,7 @@ class ResearchLabGatewayScoringWorker:
                     DockerPrivateModelSpec(
                         image_digest=active.artifact.image_digest,
                         timeout_seconds=self.config.scoring_worker_model_timeout_seconds,
+                        env_passthrough=self._private_model_env_passthrough(),
                         extra_env=self._private_scoring_env(),
                     )
                 )
@@ -650,6 +744,7 @@ class ResearchLabGatewayScoringWorker:
                 DockerPrivateModelSpec(
                     image_digest=active.artifact.image_digest,
                     timeout_seconds=self.config.scoring_worker_model_timeout_seconds,
+                    env_passthrough=self._private_model_env_passthrough(),
                     extra_env=self._private_scoring_env(),
                 )
             )
@@ -810,6 +905,7 @@ class ResearchLabGatewayScoringWorker:
             DockerPrivateModelSpec(
                 image_digest=artifact.image_digest,
                 timeout_seconds=self.config.scoring_worker_model_timeout_seconds,
+                env_passthrough=self._private_model_env_passthrough(),
                 extra_env=self._private_scoring_env(),
             )
         )
@@ -918,10 +1014,12 @@ class ResearchLabGatewayScoringWorker:
                 )
                 if runtime_error:
                     diagnostics = dict(item_summary.get("diagnostics") or {})
+                    runtime_diagnostics = _runtime_error_diagnostics(runtime_error)
                     categories = set(diagnostics.get("failure_categories") or [])
                     categories.add("runtime_provider_error")
+                    categories.add(str(runtime_diagnostics["category"]))
                     diagnostics["failure_categories"] = sorted(categories)
-                    diagnostics["runtime_error"] = runtime_error
+                    diagnostics["runtime_error"] = runtime_diagnostics
                     item_summary["diagnostics"] = diagnostics
                 per_icp_summaries.append(item_summary)
             if nonempty_output_count <= 0:
@@ -1200,24 +1298,50 @@ class ResearchLabGatewayScoringWorker:
             "score_bundle_ids": score_bundle_ids,
             "finalization_source": "gateway_qualification_worker_results",
         }
-        await create_receipt_event(
-            receipt_id=str(receipt_id),
-            ticket_id=str(candidate["ticket_id"]),
-            event_type="completed" if has_scored_candidate else "failed",
-            receipt_status="completed" if has_scored_candidate else "failed",
-            event_doc=event_doc,
-        )
-        await create_ticket_event(
-            ticket_id=str(candidate["ticket_id"]),
-            event_type="completed" if has_scored_candidate else "cancelled",
-            actor_hotkey=None,
-            reason=(
-                "gateway_research_lab_candidate_evaluation_completed"
-                if has_scored_candidate
-                else "gateway_research_lab_candidate_evaluation_failed"
-            ),
-            event_doc=event_doc,
-        )
+        try:
+            await create_receipt_event(
+                receipt_id=str(receipt_id),
+                ticket_id=str(candidate["ticket_id"]),
+                event_type="completed" if has_scored_candidate else "failed",
+                receipt_status="completed" if has_scored_candidate else "failed",
+                event_doc=event_doc,
+            )
+        except Exception as exc:
+            if not _is_event_sequence_race_error(exc):
+                raise
+            latest_receipt = await select_one(
+                "research_loop_receipt_current",
+                filters=(("receipt_id", str(receipt_id)),),
+            )
+            if latest_receipt and latest_receipt.get("current_receipt_status") != "queued":
+                logger.info(
+                    "research_lab_receipt_finalization_race_lost receipt_id=%s status=%s",
+                    compact_ref(receipt_id),
+                    latest_receipt.get("current_receipt_status"),
+                )
+                return False
+            raise
+        try:
+            await create_ticket_event(
+                ticket_id=str(candidate["ticket_id"]),
+                event_type="completed" if has_scored_candidate else "cancelled",
+                actor_hotkey=None,
+                reason=(
+                    "gateway_research_lab_candidate_evaluation_completed"
+                    if has_scored_candidate
+                    else "gateway_research_lab_candidate_evaluation_failed"
+                ),
+                event_doc=event_doc,
+            )
+        except Exception as exc:
+            if not _is_event_sequence_race_error(exc):
+                raise
+            logger.warning(
+                "research_lab_ticket_finalization_race_lost ticket_id=%s receipt_id=%s error=%s",
+                compact_ref(candidate["ticket_id"]),
+                compact_ref(receipt_id),
+                str(exc)[:240],
+            )
         logger.info(
             format_worker_block(
                 "RESEARCH LAB RECEIPT FINALIZED",
@@ -1297,7 +1421,7 @@ class ResearchLabGatewayScoringWorker:
             value = os.getenv(name)
             if value:
                 env[name] = value
-        if self.proxy_url:
+        if self.proxy_url and self.config.private_model_docker_global_proxy_enabled:
             env.update(
                 {
                     "HTTP_PROXY": self.proxy_url,
@@ -1311,6 +1435,11 @@ class ResearchLabGatewayScoringWorker:
             env["NO_PROXY"] = no_proxy
             env["no_proxy"] = no_proxy
         return env
+
+    def _private_model_env_passthrough(self) -> tuple[str, ...]:
+        return private_model_env_passthrough(
+            include_proxy=self.config.private_model_docker_global_proxy_enabled
+        )
 
 
 def _average(values: list[float]) -> float:
@@ -1360,6 +1489,15 @@ def _is_candidate_claim_race_error(exc: BaseException) -> bool:
         "research_lab_candidate_claim_conflict" in message
         or "research_lab_candidate_eval_events_candidate_seq_key" in message
         or "duplicate key" in message
+        or "unique constraint" in message
+        or "23505" in message
+    )
+
+
+def _is_event_sequence_race_error(exc: BaseException) -> bool:
+    message = str(exc).lower()
+    return (
+        "duplicate key" in message
         or "unique constraint" in message
         or "23505" in message
     )

@@ -10,13 +10,14 @@ from decimal import Decimal, ROUND_HALF_UP
 import json
 import logging
 import os
+import socket
 import time
 from typing import Any, Iterable, Mapping, Sequence
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
-from gateway.research_lab.config import ResearchLabGatewayConfig
+from gateway.research_lab.config import DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS, ResearchLabGatewayConfig
 from gateway.research_lab.key_vault import OpenRouterKeyVaultError, decrypt_openrouter_key
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block, format_worker_line
 from gateway.research_lab.loop_engine import (
@@ -25,6 +26,7 @@ from gateway.research_lab.loop_engine import (
     AutoResearchLoopSettings,
     OpenRouterCallResult,
 )
+from gateway.research_lab.maintenance import autoresearch_queue_capacity_doc, is_autoresearch_maintenance_paused
 from gateway.research_lab.models import ResearchLabCandidateArtifactCreateRequest, ResearchLabReceiptCreateRequest
 from gateway.research_lab.promotion import latest_public_benchmark_summary, load_active_private_model
 from gateway.research_lab.public_activity import safe_project_public_loop_activity
@@ -39,6 +41,8 @@ from gateway.research_lab.store import (
     create_reimbursement_award,
     create_reimbursement_schedule,
     create_ticket_event,
+    find_queued_receipt_for_run,
+    latest_auto_research_checkpoint,
     select_all,
     select_many,
     select_one,
@@ -53,6 +57,7 @@ from research_lab.auto_research_prompt import build_validated_candidate_manifest
 from research_lab.eval import (
     DockerPrivateModelRunner,
     DockerPrivateModelSpec,
+    private_model_env_passthrough,
 )
 
 
@@ -87,15 +92,83 @@ def _status_age_seconds(raw_status_at: object) -> float | None:
 
 def _status_is_stale(raw_status_at: object, stale_after_seconds: int) -> bool:
     age_seconds = _status_age_seconds(raw_status_at)
-    return age_seconds is not None and age_seconds > max(60, int(stale_after_seconds or 7200))
+    return age_seconds is not None and age_seconds > max(
+        60,
+        int(stale_after_seconds or DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS),
+    )
 
 
 class HostedResearchLabWorkerError(RuntimeError):
     """Raised when a hosted Research Lab run cannot complete safely."""
 
 
+class RetryableHostedResearchLabWorkerError(HostedResearchLabWorkerError):
+    """Raised when a paid hosted run should be requeued instead of terminally failed."""
+
+
 class HostedResearchLabClaimLost(HostedResearchLabWorkerError):
     """Raised when another worker safely claimed the queued run first."""
+
+
+_RETRYABLE_HTTP_CODES = {408, 409, 425, 429, 500, 502, 503, 504}
+_RETRYABLE_ERROR_MARKERS = (
+    "timeout",
+    "timed out",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "temporarily unavailable",
+    "service unavailable",
+    "too many requests",
+    "rate limit",
+    "http 408",
+    "http 409",
+    "http 425",
+    "http 429",
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "status 408",
+    "status 409",
+    "status 425",
+    "status 429",
+    "status 500",
+    "status 502",
+    "status 503",
+    "status 504",
+)
+_PERMANENT_ERROR_MARKERS = (
+    "duplicate key",
+    "violates unique constraint",
+    "check constraint",
+    "foreign key",
+    "invalid input syntax",
+    "permission denied",
+    "research_lab_queue_capacity_conflict",
+    "research_lab_queue_hotkey_conflict",
+    "research_lab_run_claim_conflict",
+)
+
+
+def _is_retryable_worker_exception(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, RetryableHostedResearchLabWorkerError):
+            return True
+        if isinstance(current, HTTPError):
+            code = int(getattr(current, "code", 0) or 0)
+            return code in _RETRYABLE_HTTP_CODES
+        if isinstance(current, (URLError, TimeoutError, asyncio.TimeoutError, socket.timeout, ConnectionError)):
+            return True
+        current = current.__cause__ or current.__context__
+
+    message = str(exc).lower()
+    if any(marker in message for marker in _PERMANENT_ERROR_MARKERS):
+        return False
+    return any(marker in message for marker in _RETRYABLE_ERROR_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -262,6 +335,12 @@ class ResearchLabHostedWorker:
 
     async def run_once(self) -> HostedWorkerOutcome:
         self._require_enabled()
+        if await is_autoresearch_maintenance_paused():
+            return HostedWorkerOutcome(
+                processed=False,
+                dry_run=self.config.hosted_worker_dry_run,
+                status="maintenance_paused",
+            )
         if not self.config.hosted_worker_dry_run:
             await self._recover_stale_started_runs()
         queued = await self._next_queued_run()
@@ -323,6 +402,35 @@ class ResearchLabHostedWorker:
                 error=str(exc)[:500],
             )
         except Exception as exc:
+            if _is_retryable_worker_exception(exc):
+                retry_count = _retryable_requeue_count(context)
+                retry_limit = int(self.config.hosted_worker_retryable_failure_limit)
+                if retry_count < retry_limit:
+                    logger.warning(
+                        format_worker_block(
+                            "RESEARCH LAB AUTO-RESEARCH TRANSIENT FAILURE REQUEUED",
+                            (
+                                ("Worker", self.worker_ref),
+                                ("Run", compact_ref(run_id)),
+                                ("Ticket", compact_ref(ticket_id)),
+                                ("Retry", f"{retry_count + 1}/{retry_limit}"),
+                                ("Error", str(exc)[:300]),
+                            ),
+                        )
+                    )
+                    return await self._mark_retryable(context, str(exc), retry_count=retry_count + 1)
+                logger.error(
+                    format_worker_block(
+                        "RESEARCH LAB AUTO-RESEARCH TRANSIENT RETRY LIMIT EXCEEDED",
+                        (
+                            ("Worker", self.worker_ref),
+                            ("Run", compact_ref(run_id)),
+                            ("Ticket", compact_ref(ticket_id)),
+                            ("Retries", retry_count),
+                            ("Error", str(exc)[:300]),
+                        ),
+                    )
+                )
             logger.exception(
                 format_worker_block(
                     "RESEARCH LAB AUTO-RESEARCH FAILED",
@@ -383,7 +491,10 @@ class ResearchLabHostedWorker:
         return rows[0]
 
     async def _recover_stale_started_runs(self) -> int:
-        stale_after_seconds = max(60, int(self.config.active_loop_stale_after_seconds or 7200))
+        stale_after_seconds = max(
+            60,
+            int(self.config.active_loop_stale_after_seconds or DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS),
+        )
         rows = await select_many(
             "research_loop_run_queue_current",
             columns=(
@@ -411,6 +522,7 @@ class ResearchLabHostedWorker:
                     worker_ref=self.worker_ref,
                     reason="stale_started_requeued",
                     event_doc={
+                        **autoresearch_queue_capacity_doc(self.config),
                         "recovering_worker_ref": self.worker_ref,
                         "previous_worker_ref": row.get("worker_ref"),
                         "previous_event_hash": row.get("current_event_hash"),
@@ -475,6 +587,14 @@ class ResearchLabHostedWorker:
 
     async def _process_run(self, context: HostedRunContext) -> HostedWorkerOutcome:
         await self._append_started_events(context)
+        context.receipt_id = await self._ensure_queued_receipt(context)
+        if await is_autoresearch_maintenance_paused():
+            return await self._mark_paused(
+                context,
+                loop_result=None,
+                checkpoint_doc=None,
+                reason="maintenance_pause_before_execution",
+            )
         resolved_openrouter_env = await self.key_resolver.resolve(
             _miner_openrouter_key_ref(context),
             miner_hotkey=str(context.ticket["miner_hotkey"]),
@@ -484,20 +604,21 @@ class ResearchLabHostedWorker:
             **_worker_proxy_env(self.config),
         }
         context.provider_env = provider_env
-        receipt, _event = await create_receipt(self._queued_receipt_request(context))
-        context.receipt_id = str(receipt["receipt_id"])
+        docker_provider_env = _private_model_docker_env(self.config, provider_env)
         budget_context = self._run_budget_context(context)
         _tier, model_id, model_doc = self.config.resolve_auto_research_model(
             str(budget_context.get("research_model_tier") or "")
         )
         max_candidates = self._max_candidates_for_run(budget_context, model_doc)
+        resume_state = await latest_auto_research_checkpoint(context.run_id)
 
         active_start = await load_active_private_model(self.config, register_bootstrap=True)
         artifact = active_start.artifact
         runner = DockerPrivateModelRunner(
             DockerPrivateModelSpec(
                 image_digest=artifact.image_digest,
-                extra_env=provider_env,
+                env_passthrough=_private_model_env_passthrough(self.config),
+                extra_env=docker_provider_env,
                 timeout_seconds=900,
             )
         )
@@ -521,13 +642,20 @@ class ResearchLabHostedWorker:
                 )
             )
 
+            latest_checkpoint: dict[str, Any] | None = None
+
             async def _record_loop_event(event: AutoResearchLoopEvent) -> None:
+                nonlocal latest_checkpoint
+                if event.event_type == "checkpoint_saved":
+                    checkpoint_doc = event.event_doc.get("checkpoint") if isinstance(event.event_doc, Mapping) else None
+                    if isinstance(checkpoint_doc, dict):
+                        latest_checkpoint = dict(checkpoint_doc)
                 await create_auto_research_loop_event(
                     run_id=context.run_id,
                     ticket_id=context.ticket_id,
-            receipt_id=context.receipt_id,
-            event_type=event.event_type,
-            loop_status=event.loop_status,
+                    receipt_id=context.receipt_id,
+                    event_type=event.event_type,
+                    loop_status=event.loop_status,
                     worker_ref=self.worker_ref,
                     node_id=event.node_id,
                     elapsed_seconds=event.elapsed_seconds,
@@ -598,7 +726,16 @@ class ResearchLabHostedWorker:
                 budget_context=budget_context,
                 requested_loop_count=int(context.ticket.get("requested_loop_count") or 1),
                 miner_brief_ref=str(context.ticket.get("brief_sanitized_ref") or ""),
+                resume_state=resume_state,
+                should_pause=is_autoresearch_maintenance_paused,
             )
+            if loop_result.status == "paused":
+                return await self._mark_paused(
+                    context,
+                    loop_result=loop_result,
+                    checkpoint_doc=loop_result.checkpoint_doc or latest_checkpoint,
+                    reason="maintenance_pause_checkpointed",
+                )
             if not loop_result.selected_candidates:
                 raise HostedResearchLabWorkerError("auto-research loop completed without valid candidate finalists")
 
@@ -620,7 +757,8 @@ class ResearchLabHostedWorker:
                 latest_runner = DockerPrivateModelRunner(
                     DockerPrivateModelSpec(
                         image_digest=final_artifact.image_digest,
-                        extra_env=provider_env,
+                        env_passthrough=_private_model_env_passthrough(self.config),
+                        extra_env=docker_provider_env,
                         timeout_seconds=900,
                     )
                 )
@@ -665,25 +803,6 @@ class ResearchLabHostedWorker:
                     len(finalists),
                 )
 
-        reimbursement_decision = await self._maybe_create_reimbursement_decision(
-            context=context,
-            budget_context=budget_context,
-            loop_result=loop_result,
-        )
-        await create_receipt_event(
-            receipt_id=str(context.receipt_id),
-            ticket_id=context.ticket_id,
-            event_type="completed",
-            receipt_status="completed",
-            event_doc={
-                "run_id": context.run_id,
-                "worker_ref": self.worker_ref,
-                "final_cost_ledger": loop_result.cost_ledger(),
-                "provider_usage": list(loop_result.provider_usage) or self._provider_usage(context),
-                "reimbursement": reimbursement_decision or {"status": "not_written"},
-            },
-        )
-
         candidate_ids: list[str] = []
         candidate_summaries: list[dict[str, Any]] = []
         for index, finalist in enumerate(finalists):
@@ -717,53 +836,104 @@ class ResearchLabHostedWorker:
                 }
             )
 
-        await create_queue_event(
-            run_id=context.run_id,
-            ticket_id=context.ticket_id,
-            event_type="completed",
-            queue_priority=int(context.queue_row.get("queue_priority") or 0),
-            worker_ref=self.worker_ref,
-            reason="candidate_generation_completed_evaluation_queued",
-            event_doc={
-                "receipt_id": context.receipt_id,
-                "candidate_ids": candidate_ids,
-                "candidate_count": len(candidate_ids),
-                "budget_context": _redacted_budget_context(budget_context),
-                "auto_research_loop": {
-                    "iterations_completed": loop_result.iterations_completed,
-                    "elapsed_seconds": round(loop_result.elapsed_seconds, 3),
-                    "stop_reason": loop_result.stop_reason,
-                    "openrouter_call_count": loop_result.openrouter_call_count,
-                    "estimated_cost_usd": round(loop_result.estimated_cost_usd, 6),
-                    "actual_openrouter_cost_usd": round(loop_result.actual_openrouter_cost_usd, 6),
-                },
-                "reimbursement": reimbursement_decision or {"status": "not_written"},
-                "next_stage": "gateway_qualification_worker_evaluation",
+        reimbursement_decision = await self._maybe_create_reimbursement_decision(
+            context=context,
+            budget_context=budget_context,
+            loop_result=loop_result,
+        )
+        completion_receipt_doc = {
+            "run_id": context.run_id,
+            "worker_ref": self.worker_ref,
+            "final_cost_ledger": loop_result.cost_ledger(),
+            "provider_usage": list(loop_result.provider_usage) or self._provider_usage(context),
+            "candidate_ids": list(candidate_ids),
+            "reimbursement": reimbursement_decision or {"status": "not_written"},
+        }
+
+        completion_queue_doc = {
+            "receipt_id": context.receipt_id,
+            "candidate_ids": candidate_ids,
+            "candidate_count": len(candidate_ids),
+            "budget_context": _redacted_budget_context(budget_context),
+            "auto_research_loop": {
+                "iterations_completed": loop_result.iterations_completed,
+                "elapsed_seconds": round(loop_result.elapsed_seconds, 3),
+                "stop_reason": loop_result.stop_reason,
+                "openrouter_call_count": loop_result.openrouter_call_count,
+                "estimated_cost_usd": round(loop_result.estimated_cost_usd, 6),
+                "actual_openrouter_cost_usd": round(loop_result.actual_openrouter_cost_usd, 6),
             },
-        )
-        await create_ticket_event(
-            ticket_id=context.ticket_id,
-            event_type="running",
-            actor_hotkey=None,
-            reason="candidate_generation_completed_evaluation_queued",
-            event_doc={
-                "run_id": context.run_id,
-                "receipt_id": context.receipt_id,
-                "candidate_ids": candidate_ids,
-                "auto_research_loop": {
-                    "iterations_completed": loop_result.iterations_completed,
-                    "elapsed_seconds": round(loop_result.elapsed_seconds, 3),
-                    "stop_reason": loop_result.stop_reason,
+            "reimbursement": reimbursement_decision or {"status": "not_written"},
+            "next_stage": "gateway_qualification_worker_evaluation",
+        }
+        try:
+            await create_queue_event(
+                run_id=context.run_id,
+                ticket_id=context.ticket_id,
+                event_type="completed",
+                queue_priority=int(context.queue_row.get("queue_priority") or 0),
+                worker_ref=self.worker_ref,
+                reason="candidate_generation_completed_evaluation_queued",
+                event_doc=completion_queue_doc,
+            )
+        except Exception:
+            current_after_completion = await select_one(
+                "research_loop_run_queue_current",
+                columns="run_id,current_queue_status,current_event_hash,current_event_seq",
+                filters=(("run_id", context.run_id),),
+            )
+            if not current_after_completion or current_after_completion.get("current_queue_status") != "completed":
+                raise
+            logger.warning(
+                "research_lab_completion_queue_event_insert_uncertain_but_projected_completed run_id=%s event_hash=%s",
+                compact_ref(context.run_id),
+                current_after_completion.get("current_event_hash"),
+            )
+        try:
+            await create_receipt_event(
+                receipt_id=str(context.receipt_id),
+                ticket_id=context.ticket_id,
+                event_type="completed",
+                receipt_status="completed",
+                event_doc=completion_receipt_doc,
+            )
+        except Exception as exc:
+            logger.warning(
+                "research_lab_completion_receipt_projection_failed run_id=%s receipt_id=%s error=%s",
+                compact_ref(context.run_id),
+                compact_ref(context.receipt_id),
+                str(exc)[:240],
+            )
+        try:
+            await create_ticket_event(
+                ticket_id=context.ticket_id,
+                event_type="running",
+                actor_hotkey=None,
+                reason="candidate_generation_completed_evaluation_queued",
+                event_doc={
+                    "run_id": context.run_id,
+                    "receipt_id": context.receipt_id,
+                    "candidate_ids": candidate_ids,
+                    "auto_research_loop": {
+                        "iterations_completed": loop_result.iterations_completed,
+                        "elapsed_seconds": round(loop_result.elapsed_seconds, 3),
+                        "stop_reason": loop_result.stop_reason,
+                    },
+                    "next_stage": "gateway_qualification_worker_evaluation",
                 },
-                "next_stage": "gateway_qualification_worker_evaluation",
-            },
-        )
-        await safe_project_public_loop_activity(
-            context.ticket_id,
-            source_ref=f"hosted_worker_completed:{context.run_id}",
-            reason="candidate_generation_completed_evaluation_queued",
-            config=self.config,
-        )
+            )
+            await safe_project_public_loop_activity(
+                context.ticket_id,
+                source_ref=f"hosted_worker_completed:{context.run_id}",
+                reason="candidate_generation_completed_evaluation_queued",
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "research_lab_completion_noncritical_projection_failed run_id=%s error=%s",
+                compact_ref(context.run_id),
+                str(exc)[:240],
+            )
         logger.info(
             format_worker_block(
                 "RESEARCH LAB AUTO-RESEARCH QUEUED CANDIDATES",
@@ -787,6 +957,91 @@ class ResearchLabHostedWorker:
             status="candidate_generation_completed_evaluation_queued",
             receipt_id=context.receipt_id,
             candidate_ids=tuple(candidate_ids),
+        )
+
+    async def _ensure_queued_receipt(self, context: HostedRunContext) -> str:
+        if context.receipt_id:
+            return context.receipt_id
+        existing = await find_queued_receipt_for_run(context.run_id)
+        if existing:
+            return str(existing["receipt_id"])
+        receipt, _event = await create_receipt(self._queued_receipt_request(context))
+        return str(receipt["receipt_id"])
+
+    async def _mark_paused(
+        self,
+        context: HostedRunContext,
+        *,
+        loop_result: Any | None,
+        checkpoint_doc: Mapping[str, Any] | None,
+        reason: str,
+    ) -> HostedWorkerOutcome:
+        receipt_id = context.receipt_id or await self._ensure_queued_receipt(context)
+        context.receipt_id = receipt_id
+        cost_ledger = loop_result.cost_ledger() if loop_result is not None else {
+            "schema_version": "1.0",
+            "status": "paused",
+            "total_usd": 0.0,
+            "stage": reason,
+        }
+        checkpoint_ref = None
+        if isinstance(checkpoint_doc, Mapping):
+            checkpoint_ref = checkpoint_doc.get("checkpoint_hash")
+        event_doc = {
+            "run_id": context.run_id,
+            "worker_ref": self.worker_ref,
+            "receipt_id": receipt_id,
+            "pause_reason": reason,
+            "checkpoint_hash": checkpoint_ref,
+            "auto_research_loop": {
+                "status": "paused",
+                "iterations_completed": int(getattr(loop_result, "iterations_completed", 0) or 0),
+                "elapsed_seconds": round(float(getattr(loop_result, "elapsed_seconds", 0.0) or 0.0), 3),
+                "stop_reason": getattr(loop_result, "stop_reason", "maintenance_pause_requested"),
+            },
+        }
+        if checkpoint_doc:
+            event_doc["checkpoint"] = dict(checkpoint_doc)
+        await create_receipt_event(
+            receipt_id=receipt_id,
+            ticket_id=context.ticket_id,
+            event_type="queued",
+            receipt_status="queued",
+            event_doc={
+                **event_doc,
+                "cost_ledger": cost_ledger,
+                "provider_usage": list(getattr(loop_result, "provider_usage", ()) or []) or self._provider_usage(context),
+            },
+        )
+        await create_queue_event(
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            event_type="paused",
+            queue_priority=int(context.queue_row.get("queue_priority") or 0),
+            worker_ref=self.worker_ref,
+            reason=reason,
+            event_doc=event_doc,
+        )
+        await create_ticket_event(
+            ticket_id=context.ticket_id,
+            event_type="running",
+            actor_hotkey=None,
+            reason=reason,
+            event_doc=event_doc,
+        )
+        await safe_project_public_loop_activity(
+            context.ticket_id,
+            source_ref=f"hosted_worker_paused:{context.run_id}",
+            reason=reason,
+            config=self.config,
+        )
+        return HostedWorkerOutcome(
+            processed=True,
+            dry_run=False,
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            status="maintenance_paused",
+            receipt_id=receipt_id,
         )
 
     async def _maybe_create_reimbursement_decision(
@@ -860,6 +1115,12 @@ class ResearchLabHostedWorker:
             policy_id=str(policy["policy_id"]),
             award_doc=award_doc,
         )
+        if str(award_row["award_id"]) != str(schedule["award_id"]):
+            schedule = build_reimbursement_schedule(
+                {**award, "award_id": str(award_row["award_id"])},
+                start_epoch=max(0, int(evaluation_epoch) + 1),
+            ).to_dict()
+            schedule_doc = {**schedule_doc, "schedule": schedule}
         schedule_row = await create_reimbursement_schedule(schedule=schedule, schedule_doc=schedule_doc)
         logger.info(
             format_worker_block(
@@ -918,7 +1179,7 @@ class ResearchLabHostedWorker:
             row
             for row in queue_rows
             if str(row.get("ticket_id")) in ticket_ids
-            and str(row.get("current_queue_status")) in {"queued", "started", "completed"}
+            and str(row.get("current_queue_status")) in {"queued", "started", "paused", "completed"}
             and _row_dt(row.get("current_status_at")) >= lookback_start
         ]
         distinct_hotkeys = {str(row.get("miner_hotkey")) for row in ticket_rows if row.get("miner_hotkey")}
@@ -1066,6 +1327,81 @@ class ResearchLabHostedWorker:
             error=error[:500],
         )
 
+    async def _mark_retryable(
+        self,
+        context: HostedRunContext,
+        error: str,
+        *,
+        retry_count: int,
+    ) -> HostedWorkerOutcome:
+        event_doc = {
+            **autoresearch_queue_capacity_doc(self.config),
+            "schema_version": "1.0",
+            "run_id": context.run_id,
+            "worker_ref": self.worker_ref,
+            "recovering_worker_ref": self.worker_ref,
+            "retrying_worker_ref": self.worker_ref,
+            "retryable_error": error[:500],
+            "retryable_error_count": int(retry_count),
+            "retryable_failure_limit": int(self.config.hosted_worker_retryable_failure_limit),
+            "previous_event_hash": context.queue_row.get("current_event_hash"),
+            "previous_status_at": context.queue_row.get("current_status_at"),
+        }
+        if context.receipt_id:
+            try:
+                await create_receipt_event(
+                    receipt_id=context.receipt_id,
+                    ticket_id=context.ticket_id,
+                    event_type="queued",
+                    receipt_status="queued",
+                    event_doc=event_doc,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "research_lab_retryable_receipt_event_failed run_id=%s receipt_id=%s error=%s",
+                    compact_ref(context.run_id),
+                    compact_ref(context.receipt_id),
+                    str(exc)[:240],
+                )
+        await create_queue_event(
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            event_type="queued",
+            queue_priority=int(context.queue_row.get("queue_priority") or 0),
+            worker_ref=self.worker_ref,
+            reason="transient_worker_error_requeued",
+            event_doc=event_doc,
+        )
+        try:
+            await create_ticket_event(
+                ticket_id=context.ticket_id,
+                event_type="running",
+                actor_hotkey=None,
+                reason="transient_worker_error_requeued",
+                event_doc=event_doc,
+            )
+            await safe_project_public_loop_activity(
+                context.ticket_id,
+                source_ref=f"hosted_worker_retryable_requeued:{context.run_id}",
+                reason="transient_worker_error_requeued",
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "research_lab_retryable_noncritical_projection_failed run_id=%s error=%s",
+                compact_ref(context.run_id),
+                str(exc)[:240],
+            )
+        return HostedWorkerOutcome(
+            processed=True,
+            dry_run=False,
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            status="transient_worker_error_requeued",
+            receipt_id=context.receipt_id,
+            error=error[:500],
+        )
+
     def _queued_receipt_request(self, context: HostedRunContext) -> ResearchLabReceiptCreateRequest:
         budget_context = self._run_budget_context(context)
         return ResearchLabReceiptCreateRequest(
@@ -1178,9 +1514,14 @@ class ResearchLabHostedWorker:
                     decoded = json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
                 message = exc.read().decode("utf-8", errors="replace")[:500]
-                raise HostedResearchLabWorkerError(f"OpenRouter candidate generation failed: HTTP {exc.code}: {message}") from exc
+                error = f"OpenRouter candidate generation failed: HTTP {exc.code}: {message}"
+                if int(exc.code) in _RETRYABLE_HTTP_CODES:
+                    raise RetryableHostedResearchLabWorkerError(error) from exc
+                raise HostedResearchLabWorkerError(error) from exc
             except URLError as exc:
-                raise HostedResearchLabWorkerError(f"OpenRouter candidate generation failed: {exc}") from exc
+                raise RetryableHostedResearchLabWorkerError(
+                    f"OpenRouter candidate generation failed: {exc}"
+                ) from exc
             choices = decoded.get("choices") if isinstance(decoded, Mapping) else None
             if not choices:
                 raise HostedResearchLabWorkerError("OpenRouter returned no candidate-generation choices")
@@ -1345,6 +1686,21 @@ def _payment_id_from_queue_events(events: Sequence[Mapping[str, Any]]) -> str:
     return ""
 
 
+def _retryable_requeue_count(context: HostedRunContext) -> int:
+    count = 0
+    for event in context.queue_events:
+        event_doc = event.get("event_doc")
+        if not isinstance(event_doc, Mapping):
+            event_doc = {}
+        if str(event.get("reason") or "") == "transient_worker_error_requeued" or event_doc.get("retryable_error"):
+            count += 1
+            try:
+                count = max(count, int(event_doc.get("retryable_error_count") or 0))
+            except (TypeError, ValueError):
+                pass
+    return count
+
+
 def _loop_start_credit_id_from_queue_events(events: Sequence[Mapping[str, Any]]) -> str | None:
     for event in events:
         event_doc = event.get("event_doc")
@@ -1407,6 +1763,34 @@ def _worker_proxy_env(config: ResearchLabGatewayConfig) -> dict[str, str]:
         env["NO_PROXY"] = no_proxy
         env["no_proxy"] = no_proxy
     return env
+
+
+_PROXY_ENV_NAMES = frozenset(
+    {
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+    }
+)
+
+
+def _private_model_env_passthrough(config: ResearchLabGatewayConfig) -> tuple[str, ...]:
+    return private_model_env_passthrough(
+        include_proxy=config.private_model_docker_global_proxy_enabled
+    )
+
+
+def _private_model_docker_env(
+    config: ResearchLabGatewayConfig,
+    provider_env: Mapping[str, str],
+) -> dict[str, str]:
+    env = {str(key): str(value) for key, value in provider_env.items() if value}
+    if config.private_model_docker_global_proxy_enabled:
+        return env
+    return {key: value for key, value in env.items() if key not in _PROXY_ENV_NAMES}
 
 
 def _row_partition(row: Mapping[str, Any], total_workers: int) -> int:
