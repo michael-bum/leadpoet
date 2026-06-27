@@ -379,6 +379,16 @@ def scrub_company_name(text: str, company: str) -> str:
 # FulfillmentICP
 # ---------------------------------------------------------------------------
 
+# Location values that mean "no restriction" rather than a real place. When a
+# buyer enters one of these for the COMPANY location, it is treated as an empty
+# requirement so the Tier 1 country gate, Tier 1.5a region gate, and the Stage 5
+# HQ-location skip all see "any location accepted" — identical to leaving the
+# field blank. Taken literally, "any" is NOT a country/region and would instead
+# reject nearly every lead (country_mismatch / geography checks). Contact
+# location is intentionally NOT covered here.
+_WILDCARD_LOCATIONS = frozenset({"any", "all", "global", "worldwide", "anywhere"})
+
+
 class FulfillmentICP(BaseModel):
     """ICP published to miners for a fulfillment request."""
 
@@ -813,6 +823,27 @@ class FulfillmentICP(BaseModel):
             out.append(s)
         return out
 
+    @field_validator("company_country", mode="after")
+    @classmethod
+    def _company_country_wildcard(cls, v: List[str]) -> List[str]:
+        """A wildcard sentinel (e.g. "any") in ``company_country`` means "no
+        company country requirement".  Drop the whole list so the Tier 1
+        country gate is skipped, rather than matching leads against the literal
+        string "any" (which rejects everything)."""
+        if any(s.strip().lower() in _WILDCARD_LOCATIONS for s in v):
+            return []
+        return v
+
+    @field_validator("company_region", mode="before")
+    @classmethod
+    def _company_region_wildcard(cls, v):
+        """A wildcard sentinel for ``company_region`` means "no company region
+        requirement" — normalize to empty so the Tier 1.5a region check is
+        skipped instead of running an LLM geography match against "any"."""
+        if isinstance(v, str) and v.strip().lower() in _WILDCARD_LOCATIONS:
+            return ""
+        return v
+
     @field_validator("target_role_types")
     @classmethod
     def validate_role_types(cls, v: List[str]) -> List[str]:
@@ -950,14 +981,19 @@ class FulfillmentICP(BaseModel):
 class FulfillmentLead(BaseModel):
     """Lead schema with PII — used in fulfillment commit-reveal.
 
-    All fields are required except ``phone``.  Miners that submit
-    sparse leads will be rejected at parse time rather than silently
-    scoring zero.
+    All fields are required except ``phone`` and ``email``.  Miners that
+    submit sparse leads will be rejected at parse time rather than silently
+    scoring zero.  ``email`` is optional: contact emails are sourced
+    out-of-band, so miners are not required to submit one and it is never
+    verified.  Keeping it as a defaulted field (rather than removing it)
+    keeps the commit-reveal hash backward-compatible — miners that still
+    submit an email hash it normally, and miners that omit it produce a
+    consistent ``email:""`` in both commit and reveal.
     """
 
     # PII fields (included in hash, stripped by to_lead_output)
     full_name: str
-    email: str
+    email: str = ""
     linkedin_url: str
     phone: str = ""
 
