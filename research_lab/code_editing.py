@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import posixpath
 import re
@@ -77,6 +77,78 @@ class CodeEditDraft:
         payload["unified_diff_hash"] = sha256_json({"unified_diff": self.unified_diff})
         return payload
 
+    def with_unified_diff(self, unified_diff: str) -> "CodeEditDraft":
+        return replace(self, unified_diff=normalize_unified_diff_text(unified_diff))
+
+
+@dataclass(frozen=True)
+class CodeEditSourceInspectionRequest:
+    operation: str
+    query: str = ""
+    path: str = ""
+    rationale: str = ""
+
+    def to_event_doc(self) -> dict[str, Any]:
+        payload = {
+            "operation": self.operation,
+            "query_hash": sha256_json({"query": self.query}) if self.query else "",
+            "path": self.path,
+            "rationale_hash": sha256_json({"rationale": self.rationale}) if self.rationale else "",
+        }
+        return {key: value for key, value in payload.items() if value not in {"", None}}
+
+
+def build_code_edit_source_inspection_messages(
+    *,
+    ticket: Mapping[str, Any],
+    artifact_manifest: Mapping[str, Any],
+    component_registry: Mapping[str, Any],
+    benchmark_public_summary: Mapping[str, Any],
+    runtime_source_index: Mapping[str, Any],
+    source_inspection_context: Mapping[str, Any] | None,
+    budget_context: Mapping[str, Any] | None,
+    max_requests: int = 4,
+) -> list[dict[str, str]]:
+    """Ask the model which extracted source files it needs before drafting."""
+
+    context = {
+        "ticket": _redacted_mapping(ticket),
+        "artifact_manifest": _redacted_mapping(artifact_manifest),
+        "component_registry": _redacted_mapping(component_registry),
+        "benchmark_public_summary": _redacted_mapping(benchmark_public_summary),
+        "runtime_source_index": _redacted_source_context(runtime_source_index),
+        "source_inspection_context": _redacted_source_context(source_inspection_context or {}),
+        "budget_context": _redacted_mapping(budget_context or {}),
+        "max_requests": max(1, int(max_requests)),
+        "allowed_operations": ["search", "read_file", "finish"],
+    }
+    system = (
+        "You are Leadpoet Research Lab's source-inspection planner for code-edit "
+        "autoresearch. You are inspecting the private sourcing model runtime extracted "
+        "from the current ECR image. You cannot use external tools or GitHub. Request "
+        "only local searches or exact file reads that are necessary to produce a small, "
+        "generalizable improvement patch later. Never request secrets, hidden benchmark "
+        "plaintext, judge prompts, provider keys, raw private data, or environment files."
+    )
+    user = (
+        "Return strict JSON only, no markdown.\n\n"
+        "Your job in this stage is not to write a patch. Request source context first.\n\n"
+        "Allowed request shapes:\n"
+        "{\"requests\":[{\"operation\":\"search\",\"query\":\"...\",\"rationale\":\"...\"}]}\n"
+        "{\"requests\":[{\"operation\":\"read_file\",\"path\":\"sourcing_model/foo.py\",\"rationale\":\"...\"}]}\n"
+        "{\"requests\":[{\"operation\":\"finish\",\"rationale\":\"enough exact source has been read\"}]}\n\n"
+        "Rules:\n"
+        "- Use search to locate relevant code when the exact path is unclear.\n"
+        "- Use read_file before proposing edits to any file.\n"
+        "- Only request paths listed in runtime_source_index.editable_files.\n"
+        "- Do not request Dockerfile, dependency files, lockfiles, env files, CI, credentials, or new files.\n"
+        "- Stop with finish once you have enough exact file content to draft a narrow patch.\n"
+        "- Prefer source related to query construction, ICP normalization, provider fallback, intent evidence, ranking, and adapter output.\n\n"
+        "Context JSON:\n"
+        + json.dumps(context, sort_keys=True, separators=(",", ":"))
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
 
 def build_code_edit_auto_research_messages(
     *,
@@ -84,6 +156,8 @@ def build_code_edit_auto_research_messages(
     artifact_manifest: Mapping[str, Any],
     component_registry: Mapping[str, Any],
     benchmark_public_summary: Mapping[str, Any],
+    runtime_source_context: Mapping[str, Any] | None = None,
+    source_inspection_context: Mapping[str, Any] | None = None,
     budget_context: Mapping[str, Any] | None,
     max_candidates: int,
 ) -> list[dict[str, str]]:
@@ -93,11 +167,18 @@ def build_code_edit_auto_research_messages(
     untrusted input even though miners do not supply code.
     """
 
+    source_context = _redacted_source_context(runtime_source_context or {})
+    inspection_context = _redacted_source_context(source_inspection_context or {})
+    editable_files = source_context.get("editable_files") if isinstance(source_context, Mapping) else None
+    read_files = inspection_context.get("read_files") if isinstance(inspection_context, Mapping) else None
+    example_target = _example_target_file(read_files, None) or _example_target_file(editable_files, None)
     context = {
         "ticket": _redacted_mapping(ticket),
         "artifact_manifest": _redacted_mapping(artifact_manifest),
         "component_registry": _redacted_mapping(component_registry),
         "benchmark_public_summary": _redacted_mapping(benchmark_public_summary),
+        "runtime_source_context": source_context,
+        "source_inspection_context": inspection_context,
         "budget_context": _redacted_mapping(budget_context or {}),
         "max_candidates": max(1, int(max_candidates)),
         "source_mode": "parent_image_extract",
@@ -140,27 +221,145 @@ def build_code_edit_auto_research_messages(
         "- sourcing_model/\n"
         "- validator_models/\n"
         "- research_lab_adapter.py\n\n"
+        "Active extracted source rules:\n"
+        "- The current ECR image has already been pulled and /app has already been extracted before this prompt.\n"
+        "- Use only exact files listed in Context JSON runtime_source_context.editable_files.\n"
+        "- Every target file must be listed in source_inspection_context.read_files.\n"
+        "- Build hunks only from exact file content returned in source_inspection_context.results.\n"
+        "- Do not target example, placeholder, guessed, deleted, or non-listed paths.\n\n"
         "Forbidden edits:\n"
         "- Dockerfile, CI, dependency files, lockfiles, deploy scripts, credentials, env files\n"
         "- new top-level folders or files outside the allowed runtime roots\n"
+        "- new files, even under an allowed root, unless the path already appears in editable_files\n"
         "- new external endpoints or new network clients outside existing provider modules\n"
         "- subprocess/shell execution additions\n"
         "- hidden ICP access, raw judge prompts, raw model responses, secrets, or key handling changes\n\n"
         "Diff requirements:\n"
         "- Produce a small unified diff that applies to the active runtime source extracted from the current ECR image.\n"
+        "- Build every hunk from exact source lines visible in source_inspection_context read_file results.\n"
+        "- If a read_file result is truncated, edit only the visible excerpt, or inspect a narrower relevant file in the next iteration.\n"
+        "- Do not guess function bodies, line numbers, imports, or context lines that are not visible in source_inspection_context.\n"
         "- Keep the change testable and reversible.\n"
         "- Prefer one narrow code path over broad rewrites.\n"
         "- Do not overfit to one public ICP; the improvement must generalize.\n\n"
         "Expected output shape:\n"
         "{\"candidates\":[{\"lane\":\"query_construction\",\"hypothesis\":{\"failure_mode\":\"...\","
         "\"mechanism\":\"...\",\"expected_improvement\":\"...\",\"risk\":\"...\","
-        "\"predicted_delta\":1.0},\"code_edit\":{\"target_files\":[\"sourcing_model/example.py\"],"
+        "\"predicted_delta\":1.0},\"code_edit\":{\"target_files\":[\"" + example_target + "\"],"
         "\"unified_diff\":\"diff --git ...\",\"redacted_summary\":\"...\","
         "\"test_plan\":\"...\",\"rollback_plan\":\"...\"}}]}\n\n"
         "Context JSON:\n"
         + json.dumps(context, sort_keys=True, separators=(",", ":"))
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def build_code_edit_repair_messages(
+    *,
+    draft: CodeEditDraft,
+    apply_error: str,
+    source_inspection_context: Mapping[str, Any],
+    runtime_source_context: Mapping[str, Any] | None,
+    budget_context: Mapping[str, Any] | None,
+    repair_attempt: int,
+    max_candidates: int = 1,
+) -> list[dict[str, str]]:
+    """Ask the model to repair a generated diff that failed git apply."""
+
+    source_context = _redacted_source_context(runtime_source_context or {})
+    inspection_context = _redacted_source_context(source_inspection_context or {})
+    context = {
+        "repair_attempt": max(1, int(repair_attempt)),
+        "failed_patch": {
+            "lane": draft.lane,
+            "target_files": list(draft.target_files),
+            "unified_diff": normalize_unified_diff_text(draft.unified_diff),
+            "unified_diff_hash": sha256_json({"unified_diff": draft.unified_diff}),
+            "hypothesis": {
+                "failure_mode": draft.failure_mode,
+                "mechanism": draft.mechanism,
+                "expected_improvement": draft.expected_improvement,
+                "risk": draft.risk,
+                "predicted_delta": draft.predicted_delta,
+            },
+            "redacted_summary": draft.redacted_summary,
+            "test_plan": draft.test_plan,
+            "rollback_plan": draft.rollback_plan,
+        },
+        "git_apply_error": str(apply_error or "")[:2000],
+        "runtime_source_context": source_context,
+        "source_inspection_context": inspection_context,
+        "budget_context": _redacted_mapping(budget_context or {}),
+        "max_candidates": max(1, int(max_candidates)),
+    }
+    system = (
+        "You are Leadpoet Research Lab's patch repair engine. A previous "
+        "code-edit diff failed git apply against the extracted current ECR image "
+        "source. Repair only the unified diff formatting or hunk context needed "
+        "to make it apply. Do not broaden scope, change intent, add files, edit "
+        "unread files, or use external knowledge."
+    )
+    user = (
+        "Return strict JSON only, no markdown.\n\n"
+        "Repair the failed patch so it applies cleanly to the exact source shown "
+        "in source_inspection_context. Keep the same improvement intent and only "
+        "target files listed in source_inspection_context.read_files.\n\n"
+        "Rules:\n"
+        "- Output the same candidates JSON shape used by the original code-edit draft.\n"
+        "- Include exactly one candidate.\n"
+        "- The unified_diff must start at the diff header or ---/+++ header; no prose.\n"
+        "- Do not create new files.\n"
+        "- Do not edit dependency, Docker, CI, env, credential, or lock files.\n"
+        "- Do not include secrets, hidden ICPs, judge prompts, or provider keys.\n\n"
+        "Context JSON:\n"
+        + json.dumps(context, sort_keys=True, separators=(",", ":"))
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def parse_code_edit_source_inspection_response(
+    raw_text: str,
+    *,
+    max_requests: int = 4,
+) -> list[CodeEditSourceInspectionRequest]:
+    decoded = json.loads(_extract_json_object(raw_text))
+    if not isinstance(decoded, Mapping):
+        raise ValueError("source-inspection response must be a JSON object")
+    if _contains_forbidden_material(decoded):
+        raise ValueError("source-inspection response contains forbidden private or secret material")
+    requests = decoded.get("requests")
+    if decoded.get("finish") is True and not requests:
+        return [CodeEditSourceInspectionRequest(operation="finish", rationale=str(decoded.get("rationale") or "")[:500])]
+    if not isinstance(requests, list) or not requests:
+        raise ValueError("source-inspection response requires a non-empty requests array")
+    parsed: list[CodeEditSourceInspectionRequest] = []
+    for item in requests[: max(1, int(max_requests))]:
+        if not isinstance(item, Mapping):
+            raise ValueError("source-inspection request must be an object")
+        operation = str(item.get("operation") or "").strip().lower()
+        if operation not in {"search", "read_file", "finish"}:
+            raise ValueError(f"unsupported source-inspection operation:{operation}")
+        query = str(item.get("query") or "")[:500]
+        path = ""
+        if item.get("path") is not None:
+            path = _normalize_repo_path(item.get("path"))
+        rationale = str(item.get("rationale") or "")[:700]
+        if operation == "search" and not query.strip():
+            raise ValueError("source-inspection search requires query")
+        if operation == "read_file" and not path:
+            raise ValueError("source-inspection read_file requires path")
+        if operation == "finish":
+            query = ""
+            path = ""
+        parsed.append(
+            CodeEditSourceInspectionRequest(
+                operation=operation,
+                query=query,
+                path=path,
+                rationale=rationale,
+            )
+        )
+    return parsed
 
 
 def parse_code_edit_response(raw_text: str, *, max_candidates: int = 1) -> list[CodeEditDraft]:
@@ -182,7 +381,7 @@ def parse_code_edit_response(raw_text: str, *, max_candidates: int = 1) -> list[
         if not isinstance(hypothesis, Mapping) or not isinstance(code_edit, Mapping):
             raise ValueError("candidate requires hypothesis and code_edit objects")
         target_files = tuple(_normalize_repo_path(path) for path in code_edit.get("target_files") or ())
-        unified_diff = str(code_edit.get("unified_diff") or "")
+        unified_diff = normalize_unified_diff_text(str(code_edit.get("unified_diff") or ""))
         if not unified_diff.strip():
             raise ValueError("code_edit.unified_diff is required")
         draft = CodeEditDraft(
@@ -201,6 +400,38 @@ def parse_code_edit_response(raw_text: str, *, max_candidates: int = 1) -> list[
         validate_code_edit_draft(draft)
         drafts.append(draft)
     return drafts
+
+
+def normalize_unified_diff_text(value: str) -> str:
+    """Normalize common LLM wrappers without changing patch semantics."""
+
+    text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not text:
+        return ""
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+    diff_index = text.find("diff --git ")
+    if diff_index > 0:
+        text = text[diff_index:].strip()
+    elif diff_index < 0:
+        header_candidates = [
+            index
+            for marker in ("\n--- ", "--- ")
+            if (index := text.find(marker)) >= 0
+        ]
+        if header_candidates:
+            start = min(header_candidates)
+            if text[start:].startswith("\n"):
+                start += 1
+            text = text[start:].strip()
+    if text.startswith("```"):
+        return normalize_unified_diff_text(text)
+    return text.rstrip() + "\n"
 
 
 def validate_code_edit_draft(
@@ -344,6 +575,26 @@ def _redacted_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     return decoded
 
 
+def _redacted_source_context(value: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep source inventory usable while removing obvious raw secret values."""
+
+    decoded = json.loads(json.dumps(value, default=str))
+    secret_markers = ("sk-or-", "sb_secret", "aws_secret_access_key", "password=", "private_key")
+
+    def scrub(item: Any) -> Any:
+        if isinstance(item, Mapping):
+            return {str(key): scrub(val) for key, val in item.items()}
+        if isinstance(item, list):
+            return [scrub(val) for val in item]
+        if isinstance(item, str):
+            if any(marker in item.lower() for marker in secret_markers):
+                return "[redacted secret-like value]"
+            return item
+        return item
+
+    return scrub(decoded)
+
+
 def _extract_json_object(raw_text: str) -> str:
     text = raw_text.strip()
     if text.startswith("```"):
@@ -351,7 +602,26 @@ def _extract_json_object(raw_text: str) -> str:
         if "\n" in text:
             text = text.split("\n", 1)[1].strip()
     start = text.find("{")
-    end = text.rfind("}")
-    if start < 0 or end < start:
+    if start < 0:
         raise ValueError("response did not contain a JSON object")
-    return text[start : end + 1]
+    decoder = json.JSONDecoder()
+    try:
+        _obj, end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError as exc:
+        raise ValueError(str(exc)) from exc
+    return text[start : start + end]
+
+
+def _example_target_file(editable_files: Any, file_previews: Any) -> str:
+    if isinstance(file_previews, list):
+        for item in file_previews:
+            if isinstance(item, Mapping):
+                path = str(item.get("path") or "")
+                if path:
+                    return path
+    if isinstance(editable_files, list):
+        for item in editable_files:
+            path = str(item or "")
+            if path:
+                return path
+    return "research_lab_adapter.py"

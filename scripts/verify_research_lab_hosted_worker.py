@@ -18,7 +18,12 @@ if str(ROOT) not in sys.path:
 
 from leadpoet_verifier.research_evaluation import build_research_evaluation_score_bundle  # noqa: E402
 from gateway.research_lab.config import ResearchLabGatewayConfig  # noqa: E402
-from gateway.research_lab.code_build import CodeEditBuildError, CodeEditCandidateBuilder  # noqa: E402
+from gateway.research_lab.code_build import (  # noqa: E402
+    CodeEditBuildError,
+    CodeEditCandidateBuilder,
+    resolve_source_inspection_requests,
+)
+from gateway.research_lab.code_loop_engine import CodeEditLoopEngine  # noqa: E402
 from gateway.research_lab.loop_engine import (  # noqa: E402
     AutoResearchLoopEngine,
     AutoResearchLoopEvent,
@@ -42,7 +47,11 @@ from research_lab.auto_research_prompt import (  # noqa: E402
     parse_auto_research_response,
 )
 from research_lab.canonical import sha256_json  # noqa: E402
-from research_lab.code_editing import CodeEditDraft, validate_code_edit_draft  # noqa: E402
+from research_lab.code_editing import (
+    CodeEditDraft,
+    CodeEditSourceInspectionRequest,
+    validate_code_edit_draft,
+)  # noqa: E402
 from research_lab.eval.private_runtime import DEFAULT_ENV_PASSTHROUGH  # noqa: E402
 from research_lab.eval.artifacts import PrivateModelArtifactManifest  # noqa: E402
 from research_lab.validator_integration import verify_research_lab_evaluation_bundle_page  # noqa: E402
@@ -205,6 +214,7 @@ def main() -> int:
     if "private_model_manifest_hash\", artifact.manifest_hash" not in scoring_worker_text:
         errors.append("private baseline lookup must filter by active private model manifest hash")
     errors.extend(_verify_image_extracted_code_builder(artifact))
+    errors.extend(asyncio.run(_verify_code_edit_loop_uses_extracted_source_context(artifact)))
 
     eval_bundle = _score_bundle()
     page = {
@@ -580,6 +590,57 @@ def _verify_image_extracted_code_builder(artifact: PrivateModelArtifactManifest)
                 private_artifact_manifest_output=".research_lab/candidate_manifest.json",
                 code_edit_build_timeout_seconds=30,
             )
+            builder = CodeEditCandidateBuilder(config)
+            source_context = builder.prepare_parent_source_context(
+                parent_artifact=artifact,
+                workspace_dir=tmp_dir / "source_context",
+            )
+            if "requirements.txt" in source_context.editable_files:
+                errors.append("source context exposed requirements.txt as editable")
+            if any(path.endswith(".env") or "/.env" in path for path in source_context.editable_files):
+                errors.append("source context exposed env files as editable")
+            unread_errors = builder.validate_draft_against_source_context(
+                _allowed_runtime_patch_draft(),
+                source_context,
+                read_paths=(),
+                require_read=True,
+            )
+            if "code_edit_unread_source_file:sourcing_model/__init__.py" not in unread_errors:
+                errors.append("source context validation did not reject unread target file")
+            batch = resolve_source_inspection_requests(
+                source_context,
+                [
+                    CodeEditSourceInspectionRequest(
+                        operation="search",
+                        query="qualify",
+                        rationale="locate model entry point",
+                    ),
+                    CodeEditSourceInspectionRequest(
+                        operation="read_file",
+                        path="sourcing_model/__init__.py",
+                        rationale="read exact target file",
+                    ),
+                    CodeEditSourceInspectionRequest(
+                        operation="read_file",
+                        path="sourcing_model/secret_like.py",
+                        rationale="verify redaction",
+                    ),
+                ],
+                already_read_paths=(),
+                max_files=8,
+                max_file_bytes=24_000,
+                max_total_bytes=120_000,
+                max_search_matches=30,
+            )
+            if "sourcing_model/__init__.py" not in batch.read_paths:
+                errors.append("source inspection read did not record requested file")
+            if batch.model_context.get("bytes_returned", 0) <= 0:
+                errors.append("source inspection read returned no source bytes")
+            serialized_context = json.dumps(batch.model_context)
+            if "password=not-a-real-secret" in serialized_context:
+                errors.append("source inspection leaked secret-like source content")
+            if "[redacted secret-like source line]" not in serialized_context:
+                errors.append("source inspection did not redact secret-like source line")
             result = CodeEditCandidateBuilder(config).build(
                 draft=_allowed_runtime_patch_draft(),
                 parent_artifact=artifact,
@@ -603,6 +664,15 @@ def _verify_image_extracted_code_builder(artifact: PrivateModelArtifactManifest)
                     errors.append(f"fake docker did not observe expected call: {expected}")
             if any(" pull " in f" {call} " for call in docker_calls):
                 errors.append("code builder pulled parent image even though image inspect succeeded")
+
+            result_recount = CodeEditCandidateBuilder(config).build(
+                draft=_allowed_runtime_patch_draft_with_bad_hunk_counts(),
+                parent_artifact=artifact,
+                run_id="77777777-7777-4777-8777-777777777778",
+                candidate_index=1,
+            )
+            if "sourcing_model/__init__.py" not in result_recount.build_doc.get("changed_files", []):
+                errors.append("code builder did not tolerate generated diff hunk count drift")
         except Exception as exc:
             errors.append(f"image-extracted code builder failed valid fake build: {exc}")
         finally:
@@ -659,6 +729,261 @@ def _verify_image_extracted_code_builder(artifact: PrivateModelArtifactManifest)
     return errors
 
 
+async def _verify_code_edit_loop_uses_extracted_source_context(
+    artifact: PrivateModelArtifactManifest,
+) -> list[str]:
+    errors: list[str] = []
+    events: list[AutoResearchLoopEvent] = []
+    calls: list[dict[str, object]] = []
+
+    with tempfile.TemporaryDirectory(prefix="research-lab-code-loop-verify-") as tmp:
+        tmp_dir = Path(tmp)
+        fake_app = tmp_dir / "fake_parent_app"
+        _write_fake_parent_app(fake_app)
+        fake_docker = _write_fake_docker(tmp_dir)
+        manifest_writer = _write_fake_manifest_writer(tmp_dir)
+        docker_log = tmp_dir / "docker.log"
+        old_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "FAKE_PARENT_APP": os.environ.get("FAKE_PARENT_APP"),
+            "FAKE_DOCKER_LOG": os.environ.get("FAKE_DOCKER_LOG"),
+        }
+        os.environ["PATH"] = str(fake_docker.parent) + os.pathsep + old_env["PATH"]
+        os.environ["FAKE_PARENT_APP"] = str(fake_app)
+        os.environ["FAKE_DOCKER_LOG"] = str(docker_log)
+        inspection_call_count = 0
+
+        async def _call_model(messages, timeout_seconds: int, max_tokens: int) -> OpenRouterCallResult:
+            nonlocal inspection_call_count
+            content = "\n".join(str(message.get("content") or "") for message in messages)
+            is_source_inspection = "runtime_source_index" in content
+            is_repair = "failed_patch" in content and "git_apply_error" in content
+            if is_source_inspection:
+                inspection_call_count += 1
+            calls.append(
+                {
+                    "stage": (
+                        "source_inspection"
+                        if is_source_inspection
+                        else "code_edit_repair"
+                        if is_repair
+                        else "code_edit_draft"
+                    ),
+                    "timeout_seconds": timeout_seconds,
+                    "max_tokens": max_tokens,
+                    "has_runtime_source_context": "runtime_source_context" in content,
+                    "has_runtime_source_index": "runtime_source_index" in content,
+                    "has_source_inspection_context": "source_inspection_context" in content,
+                    "has_real_file": "sourcing_model/__init__.py" in content,
+                    "has_source_excerpt": "VALUE" in content and "def qualify" in content,
+                    "has_bad_example": "sourcing_model/example.py" in content,
+                }
+            )
+            if is_source_inspection:
+                if inspection_call_count == 1:
+                    return OpenRouterCallResult(
+                        content=json.dumps(
+                            {
+                                "requests": [
+                                    {
+                                        "operation": "read_file",
+                                        "path": "sourcing_model/__init__.py",
+                                        "rationale": "read exact model entry source before editing",
+                                    }
+                                ]
+                            },
+                            sort_keys=True,
+                        ),
+                        provider_usage={
+                            "provider": "openrouter",
+                            "response_id": f"code-edit-source-inspection-{inspection_call_count}",
+                            "cost_microusd": 1000,
+                        },
+                        cost_microusd=1000,
+                    )
+                return OpenRouterCallResult(
+                    content=json.dumps(
+                        {"requests": [{"operation": "finish", "rationale": "enough source has been read"}]},
+                        sort_keys=True,
+                    ),
+                    provider_usage={
+                        "provider": "openrouter",
+                        "response_id": f"code-edit-source-inspection-{inspection_call_count}",
+                        "cost_microusd": 1000,
+                    },
+                    cost_microusd=1000,
+                )
+            if is_repair:
+                return OpenRouterCallResult(
+                    content=json.dumps(
+                        {
+                            "candidates": [
+                                {
+                                    "lane": "query_construction",
+                                    "hypothesis": {
+                                        "failure_mode": "stale query constant",
+                                        "mechanism": "repair patch hunk against exact extracted source",
+                                        "expected_improvement": "better source-context grounded edits",
+                                        "risk": "low",
+                                        "predicted_delta": 1.0,
+                                    },
+                                    "code_edit": {
+                                        "target_files": ["sourcing_model/__init__.py"],
+                                        "unified_diff": _allowed_runtime_patch_draft().unified_diff,
+                                        "redacted_summary": "repair existing extracted file edit",
+                                        "test_plan": "py_compile changed file",
+                                        "rollback_plan": "revert patch",
+                                    },
+                                }
+                            ]
+                        },
+                        sort_keys=True,
+                    ),
+                    provider_usage={"provider": "openrouter", "response_id": "code-edit-repair-draft", "cost_microusd": 1000},
+                    cost_microusd=1000,
+                )
+            return OpenRouterCallResult(
+                content=json.dumps(
+                    {
+                        "candidates": [
+                            {
+                                "lane": "query_construction",
+                                "hypothesis": {
+                                    "failure_mode": "stale query constant",
+                                    "mechanism": "small source edit against extracted file",
+                                    "expected_improvement": "better source-context grounded edits",
+                                    "risk": "low",
+                                    "predicted_delta": 1.0,
+                                },
+                                "code_edit": {
+                                    "target_files": ["sourcing_model/__init__.py"],
+                                    "unified_diff": (
+                                        "Here is the patch:\n```diff\n"
+                                        "diff --git a/sourcing_model/__init__.py b/sourcing_model/__init__.py\n"
+                                        "--- a/sourcing_model/__init__.py\n"
+                                        "+++ b/sourcing_model/__init__.py\n"
+                                        "@@ -1,5 +1,5 @@\n"
+                                        "this is not a valid unified diff hunk\n"
+                                        "```\n"
+                                    ),
+                                    "redacted_summary": "edit existing extracted file",
+                                    "test_plan": "py_compile changed file",
+                                    "rollback_plan": "revert patch",
+                                },
+                            }
+                        ]
+                    },
+                    sort_keys=True,
+                ),
+                provider_usage={"provider": "openrouter", "response_id": "code-edit-source-context-draft", "cost_microusd": 1000},
+                cost_microusd=1000,
+            )
+
+        async def _event_sink(event: AutoResearchLoopEvent) -> None:
+            events.append(event)
+
+        try:
+            config = ResearchLabGatewayConfig(
+                private_test_cmd="python3 -m py_compile research_lab_adapter.py sourcing_model/__init__.py",
+                private_build_cmd=f"python3 {manifest_writer}",
+                private_artifact_manifest_output=".research_lab/candidate_manifest.json",
+                code_edit_build_timeout_seconds=30,
+            )
+            result = await CodeEditLoopEngine(
+                settings=AutoResearchLoopSettings(
+                    min_seconds=0,
+                    max_seconds=30,
+                    min_iterations=1,
+                    max_iterations=1,
+                    draft_timeout_seconds=10,
+                    reflection_timeout_seconds=10,
+                    estimated_iteration_cost_usd=0.01,
+                    max_candidates=1,
+                ),
+                call_openrouter=_call_model,
+                event_sink=_event_sink,
+                builder=CodeEditCandidateBuilder(config),
+            ).run(
+                run_id="99999999-9999-4999-8999-999999999999",
+                ticket={
+                    "ticket_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "miner_hotkey": "5FminerHotkeyCodeEdit",
+                    "island": "generalist",
+                    "brief_sanitized_ref": "brief_sanitized:sha256:sourcecontext",
+                    "ticket_doc": {"brief_public_summary": "source-context grounded code edit"},
+                    "requested_loop_count": 1,
+                },
+                artifact=artifact,
+                component_registry={},
+                benchmark_public_summary={"item_count": 10},
+                model_id="test/code-edit-model",
+                budget_context={"requested_compute_budget_usd": 5.0, "research_model_tier": "default"},
+                requested_loop_count=1,
+            )
+            if not result.selected_candidates:
+                errors.append("code-edit loop did not build a candidate from extracted source context")
+            if not calls or calls[0].get("stage") != "source_inspection":
+                errors.append("code-edit loop did not inspect source before drafting")
+            if not calls or not calls[0].get("has_runtime_source_index"):
+                errors.append("source inspection prompt did not include runtime_source_index")
+            if calls and calls[0].get("has_source_excerpt"):
+                errors.append("source inspection prompt included raw source before read_file")
+            draft_calls = [call for call in calls if call.get("stage") == "code_edit_draft"]
+            if not draft_calls or not draft_calls[0].get("has_runtime_source_context"):
+                errors.append("code-edit draft prompt did not include runtime_source_context")
+            if not draft_calls or not draft_calls[0].get("has_source_inspection_context"):
+                errors.append("code-edit draft prompt did not include source_inspection_context")
+            if not draft_calls or not draft_calls[0].get("has_real_file"):
+                errors.append("code-edit draft prompt did not include real extracted editable file paths")
+            if not draft_calls or not draft_calls[0].get("has_source_excerpt"):
+                errors.append("code-edit draft prompt did not include inspected source content")
+            if calls and any(call.get("has_bad_example") for call in calls):
+                errors.append("code-edit draft prompt still suggests nonexistent sourcing_model/example.py")
+            event_types = [event.event_type for event in events]
+            if "source_inspection_requested" not in event_types:
+                errors.append("code-edit loop did not record source_inspection_requested")
+            if "source_inspection_resolved" not in event_types:
+                errors.append("code-edit loop did not record source_inspection_resolved")
+            if "code_edit_drafted" not in event_types:
+                errors.append("code-edit loop did not record code_edit_drafted")
+            elif (
+                "source_inspection_resolved" in event_types
+                and event_types.index("source_inspection_resolved") > event_types.index("code_edit_drafted")
+            ):
+                errors.append("code-edit loop drafted before resolving source inspection")
+            if "candidate_patch_apply_failed" not in event_types:
+                errors.append("code-edit loop did not classify the malformed draft as candidate_patch_apply_failed")
+            if "code_edit_repair_requested" not in event_types:
+                errors.append("code-edit loop did not request patch repair after apply failure")
+            if "code_edit_repair_drafted" not in event_types:
+                errors.append("code-edit loop did not record repaired patch draft")
+            if "candidate_build_passed" not in event_types:
+                errors.append("code-edit loop did not record candidate_build_passed")
+            elif (
+                "code_edit_repair_drafted" in event_types
+                and event_types.index("code_edit_repair_drafted") > event_types.index("candidate_build_passed")
+            ):
+                errors.append("candidate build passed before repaired patch was drafted")
+            first_doc = events[0].event_doc if events else {}
+            if first_doc.get("source_mode") != "parent_image_extract":
+                errors.append("code-edit loop start event did not record parent image extraction")
+            docker_calls = docker_log.read_text(encoding="utf-8").splitlines()
+            if sum(1 for call in docker_calls if call.startswith("cp ")) != 1:
+                errors.append("code-edit loop should extract parent image once before drafting")
+        except Exception as exc:
+            errors.append(f"code-edit loop source-context verification failed: {exc}")
+        finally:
+            os.environ["PATH"] = old_env["PATH"]
+            for key in ("FAKE_PARENT_APP", "FAKE_DOCKER_LOG"):
+                old_value = old_env[key]
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+    return errors
+
+
 def _write_fake_parent_app(root: Path, *, omit: tuple[str, ...] = ()) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for rel in ("gateway", "qualification", "sourcing_model", "validator_models"):
@@ -670,6 +995,11 @@ def _write_fake_parent_app(root: Path, *, omit: tuple[str, ...] = ()) -> None:
         'VALUE = "old"\n\n\ndef qualify():\n    return VALUE\n',
         encoding="utf-8",
     )
+    (root / "sourcing_model" / "secret_like.py").write_text(
+        'CONFIG_VALUE = "password=not-a-real-secret"\n',
+        encoding="utf-8",
+    )
+    (root / "gateway" / ".env").write_text("SHOULD_NOT_BE_INDEXED=1\n", encoding="utf-8")
     if "research_lab_adapter.py" not in omit:
         (root / "research_lab_adapter.py").write_text(
             'def adapter_metadata():\n    return {"adapter_version": "fake-adapter:v1"}\n',
@@ -736,6 +1066,11 @@ def _write_fake_manifest_writer(root: Path) -> Path:
 
             output = Path(os.environ["RESEARCH_LAB_PRIVATE_ARTIFACT_MANIFEST_OUTPUT"])
             git_commit_sha = os.environ["RESEARCH_LAB_PRIVATE_COMMIT_SHA"]
+            dockerfile = Path("Dockerfile.research-lab").read_text(encoding="utf-8")
+            if "python:3.11-slim" in dockerfile:
+                raise SystemExit("candidate Dockerfile should not use Docker Hub python base image")
+            if not dockerfile.startswith("FROM 123456789012.dkr.ecr.us-east-1.amazonaws.com/leadpoet/sourcing-model@sha256:"):
+                raise SystemExit("candidate Dockerfile should inherit from parent ECR image")
             payload = {
                 "model_artifact_hash": "sha256:" + "8" * 64,
                 "git_commit_sha": git_commit_sha,
@@ -780,6 +1115,23 @@ def _allowed_runtime_patch_draft() -> CodeEditDraft:
         redacted_summary="Change one runtime source constant.",
         test_plan="py_compile changed file.",
         rollback_plan="Revert this diff.",
+    )
+
+
+def _allowed_runtime_patch_draft_with_bad_hunk_counts() -> CodeEditDraft:
+    draft = _allowed_runtime_patch_draft()
+    return CodeEditDraft(
+        failure_mode=draft.failure_mode,
+        mechanism=draft.mechanism,
+        expected_improvement=draft.expected_improvement,
+        risk=draft.risk,
+        lane=draft.lane,
+        target_files=draft.target_files,
+        unified_diff=draft.unified_diff.replace("@@ -1,5 +1,5 @@", "@@ -1,99 +1,99 @@"),
+        redacted_summary=draft.redacted_summary,
+        test_plan=draft.test_plan,
+        rollback_plan=draft.rollback_plan,
+        predicted_delta=draft.predicted_delta,
     )
 
 
