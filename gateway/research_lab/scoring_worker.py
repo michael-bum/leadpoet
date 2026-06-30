@@ -5,20 +5,31 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from datetime import datetime, timezone
+import json
 import logging
 import os
+from pathlib import Path
+import tempfile
 import time
 from typing import Any, Mapping
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
 
 from gateway.research_lab.bundles import build_research_lab_audit_bundle
 from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
+from gateway.research_lab.code_build import (
+    CodeEditBuildError,
+    CodeEditCandidateBuilder,
+    CodeEditPatchApplyError,
+    resolve_source_inspection_requests,
+)
 from gateway.research_lab.config import ResearchLabGatewayConfig
 from gateway.research_lab.icp_window import (
     RollingIcpWindowUnavailable,
     fetch_rolling_icp_window,
 )
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block
-from gateway.research_lab.models import ResearchLabScoreBundleCreateRequest
+from gateway.research_lab.models import ResearchLabCandidateArtifactCreateRequest, ResearchLabScoreBundleCreateRequest
 from gateway.research_lab.promotion import (
     ResearchLabPromotionController,
     load_active_private_model,
@@ -31,6 +42,7 @@ from gateway.research_lab.public_benchmarks import (
 )
 from gateway.research_lab.store import (
     canonical_hash,
+    create_candidate_artifact,
     create_candidate_evaluation_event,
     create_candidate_promotion_event,
     create_private_model_benchmark_bundle,
@@ -45,6 +57,14 @@ from gateway.research_lab.store import (
     select_all,
     select_many,
     select_one,
+)
+from research_lab.canonical import sha256_json
+from research_lab.code_editing import (
+    CodeEditDraft,
+    CodeEditSourceInspectionRequest,
+    build_code_edit_repair_messages,
+    extract_unified_diff_paths,
+    parse_code_edit_repair_response,
 )
 from research_lab.eval import (
     DockerPrivateModelRunner,
@@ -63,6 +83,28 @@ from research_lab.eval.evaluator import QualificationStyleCompanyScorer
 logger = logging.getLogger(__name__)
 PRIVATE_BASELINE_FAST_EMPTY_ABORT_AFTER = 6
 PRIVATE_BASELINE_FAST_EMPTY_ABORT_SECONDS = 90.0
+
+
+class StaleParentDuringScoring(RuntimeError):
+    """Raised at an ICP boundary when a candidate's parent is no longer current."""
+
+    def __init__(
+        self,
+        *,
+        active_artifact: PrivateModelArtifactManifest,
+        candidate_parent: str,
+        progress: Mapping[str, Any],
+    ) -> None:
+        self.active_artifact = active_artifact
+        self.candidate_parent = candidate_parent
+        self.progress = dict(progress)
+        completed = int(self.progress.get("completed_icp_count") or 0)
+        super().__init__(
+            "candidate parent changed during scoring: "
+            f"candidate_parent={compact_ref(candidate_parent)} "
+            f"active_parent={compact_ref(active_artifact.model_artifact_hash)} "
+            f"completed_icps={completed}"
+        )
 
 
 def _idle_log_seconds() -> float:
@@ -167,6 +209,151 @@ def _candidate_scoring_failure_class(exc: BaseException) -> tuple[str, bool]:
     if isinstance(exc, PrivateModelRuntimeError):
         return "candidate_runtime_error", False
     return "candidate_scoring_error", False
+
+
+def _load_candidate_source_diff(candidate: Mapping[str, Any]) -> str:
+    build_doc = candidate.get("candidate_build_doc")
+    if not isinstance(build_doc, Mapping):
+        raise CodeEditBuildError("stale candidate is missing candidate_build_doc")
+    uri = str(build_doc.get("source_diff_artifact_uri") or "")
+    if not uri:
+        raise CodeEditBuildError("stale candidate has no private source diff artifact")
+    expected_source_diff_hash = str(
+        candidate.get("candidate_source_diff_hash")
+        or build_doc.get("source_diff_hash")
+        or ""
+    )
+    payload = _load_private_json_artifact(uri)
+    unified_diff = str(payload.get("unified_diff") or "")
+    if not unified_diff.strip():
+        raise CodeEditBuildError("private source diff artifact is missing unified_diff")
+    actual_source_diff_hash = sha256_json({"unified_diff": unified_diff})
+    if expected_source_diff_hash and actual_source_diff_hash != expected_source_diff_hash:
+        raise CodeEditBuildError(
+            "private source diff artifact hash mismatch: "
+            f"expected={compact_ref(expected_source_diff_hash)} actual={compact_ref(actual_source_diff_hash)}"
+        )
+    return unified_diff
+
+
+def _stale_parent_rebase_depth(candidate: Mapping[str, Any]) -> int:
+    build_doc = candidate.get("candidate_build_doc")
+    if not isinstance(build_doc, Mapping):
+        return 0
+    rebase_doc = build_doc.get("stale_parent_rebase")
+    if not isinstance(rebase_doc, Mapping):
+        return 0
+    try:
+        return max(1, int(rebase_doc.get("depth") or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _stale_parent_progress_doc(progress: Mapping[str, Any]) -> dict[str, Any]:
+    doc: dict[str, Any] = {
+        "phase": str(progress.get("phase") or "")[:80],
+        "completed_icp_count": int(progress.get("completed_icp_count") or 0),
+    }
+    for key in ("next_icp_index", "last_icp_index"):
+        if key in progress:
+            try:
+                doc[key] = int(progress.get(key) or 0)
+            except (TypeError, ValueError):
+                pass
+    for key in ("icp_ref", "icp_hash"):
+        value = str(progress.get(key) or "").strip()
+        if value:
+            doc[key] = value[:160]
+    return doc
+
+
+def _load_private_json_artifact(uri: str) -> dict[str, Any]:
+    if uri.startswith("s3://"):
+        bucket, key = _parse_s3_uri(uri)
+        try:
+            import boto3  # type: ignore
+        except Exception as exc:
+            raise CodeEditBuildError("boto3 is required to load private source diff artifacts") from exc
+        response = boto3.client("s3").get_object(Bucket=bucket, Key=key)
+        raw = response["Body"].read().decode("utf-8")
+    else:
+        raw = Path(uri).expanduser().read_text(encoding="utf-8")
+    decoded = json.loads(raw)
+    if not isinstance(decoded, Mapping):
+        raise CodeEditBuildError("private source diff artifact must be a JSON object")
+    text = json.dumps(decoded, sort_keys=True).lower()
+    if any(marker in text for marker in ("sk-or-", "service_role", "openrouter_api_key", "raw_secret")):
+        raise CodeEditBuildError("private source diff artifact contains forbidden secret-like material")
+    return dict(decoded)
+
+
+def _parse_s3_uri(uri: str) -> tuple[str, str]:
+    raw = str(uri or "")
+    if not raw.startswith("s3://"):
+        raise CodeEditBuildError("expected s3:// URI")
+    without_scheme = raw[5:]
+    bucket, sep, key = without_scheme.partition("/")
+    if not bucket or not sep or not key:
+        raise CodeEditBuildError("invalid s3 URI")
+    return bucket, key
+
+
+def _extract_diff_paths_safe(unified_diff: str) -> set[str]:
+    try:
+        return extract_unified_diff_paths(unified_diff)
+    except Exception:
+        return set()
+
+
+async def _call_operator_openrouter_json(
+    *,
+    api_key: str,
+    model_id: str,
+    messages: list[dict[str, str]],
+    timeout_seconds: int,
+) -> str:
+    body = {
+        "model": model_id,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": 2200,
+        "response_format": {"type": "json_object"},
+        "provider": {
+            "data_collection": "deny",
+            "zdr": True,
+        },
+    }
+
+    def _call() -> str:
+        req = urlrequest.Request(
+            "https://openrouter.ai/api/v1/chat/completions",
+            data=json.dumps(body).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urlrequest.urlopen(req, timeout=max(1, int(timeout_seconds))) as response:
+                decoded = json.loads(response.read().decode("utf-8"))
+        except HTTPError as exc:
+            message = exc.read().decode("utf-8", errors="replace")[:500]
+            raise CodeEditBuildError(f"operator stale-parent repair failed: HTTP {exc.code}: {message}") from exc
+        except URLError as exc:
+            raise CodeEditBuildError(f"operator stale-parent repair failed: {exc}") from exc
+        choices = decoded.get("choices") if isinstance(decoded, Mapping) else None
+        if not isinstance(choices, list) or not choices:
+            raise CodeEditBuildError("operator stale-parent repair returned no choices")
+        first = choices[0] if isinstance(choices[0], Mapping) else {}
+        message = first.get("message") if isinstance(first.get("message"), Mapping) else {}
+        content = message.get("content")
+        if not content:
+            raise CodeEditBuildError("operator stale-parent repair returned empty content")
+        return str(content)
+
+    return await asyncio.to_thread(_call)
 
 
 def _status_age_seconds(raw_status_at: object) -> float | None:
@@ -622,6 +809,7 @@ class ResearchLabGatewayScoringWorker:
             if stale_result.get("status") in {
                 "legacy_patch_candidate_unsupported",
                 "stale_parent_needs_rescore",
+                "stale_parent_rebase_failed",
             }:
                 await self._maybe_finalize_candidate_receipt(candidate)
                 await safe_project_public_loop_activity(
@@ -641,6 +829,19 @@ class ResearchLabGatewayScoringWorker:
                             ("Worker", self.worker_ref),
                             ("Candidate", compact_ref(candidate_id)),
                             ("Status", stale_result.get("status")),
+                            ("Elapsed", f"{time.time() - start:.1f}s"),
+                        ),
+                    )
+                )
+                return
+            if stale_result.get("status") == "stale_parent_rebased_to_current":
+                logger.info(
+                    format_worker_block(
+                        "RESEARCH LAB CANDIDATE REBASED BEFORE SCORING",
+                        (
+                            ("Worker", self.worker_ref),
+                            ("Candidate", compact_ref(candidate_id)),
+                            ("Derived candidate", compact_ref(stale_result.get("derived_candidate_id"))),
                             ("Elapsed", f"{time.time() - start:.1f}s"),
                         ),
                     )
@@ -728,6 +929,28 @@ class ResearchLabGatewayScoringWorker:
                 window_hash=window.window_hash,
                 evaluation_epoch=evaluation_epoch,
             )
+            last_parent_check_at = 0.0
+
+            async def parent_freshness_check(progress: Mapping[str, Any]) -> None:
+                nonlocal last_parent_check_at
+                now = time.time()
+                phase = str(progress.get("phase") or "")
+                if (
+                    phase != "before_icp"
+                    and last_parent_check_at
+                    and now - last_parent_check_at < self.config.stale_parent_check_interval_seconds
+                ):
+                    return
+                last_parent_check_at = now
+                active = await load_active_private_model(self.config, register_bootstrap=True)
+                active_parent = active.artifact.model_artifact_hash
+                if active_parent != artifact.model_artifact_hash:
+                    raise StaleParentDuringScoring(
+                        active_artifact=active.artifact,
+                        candidate_parent=artifact.model_artifact_hash,
+                        progress=progress,
+                    )
+
             heartbeat_task = asyncio.create_task(
                 self._candidate_scoring_heartbeat(
                     candidate=candidate,
@@ -736,22 +959,59 @@ class ResearchLabGatewayScoringWorker:
                 )
             )
             try:
-                score_bundle = await evaluate_private_model_pair(
-                    artifact_manifest=artifact,
-                    benchmark=benchmark,
-                    patch_manifest=patch,
-                    candidate_artifact_manifest=candidate_artifact.to_dict(),
-                    benchmark_items=window.benchmark_items,
-                    base_runner=runner,
-                    candidate_runner=candidate_runner,
-                    run_context={**run_context, "signature_ref": "pending"},
-                    policy=self._evaluation_policy(),
-                    private_holdout_gate=private_holdout_gate,
+                try:
+                    score_bundle = await evaluate_private_model_pair(
+                        artifact_manifest=artifact,
+                        benchmark=benchmark,
+                        patch_manifest=patch,
+                        candidate_artifact_manifest=candidate_artifact.to_dict(),
+                        benchmark_items=window.benchmark_items,
+                        base_runner=runner,
+                        candidate_runner=candidate_runner,
+                        run_context={**run_context, "signature_ref": "pending"},
+                        policy=self._evaluation_policy(),
+                        private_holdout_gate=private_holdout_gate,
+                        parent_freshness_check=parent_freshness_check,
+                    )
+                finally:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
+            except StaleParentDuringScoring as stale_exc:
+                stale_result = await self._queue_stale_parent_rebase(
+                    candidate,
+                    active_artifact=stale_exc.active_artifact,
+                    candidate_parent=stale_exc.candidate_parent,
+                    evaluation_epoch=evaluation_epoch,
+                    elapsed_seconds=round(time.time() - start, 3),
+                    stage="during_scoring_parent_changed",
+                    stale_progress=stale_exc.progress,
                 )
-            finally:
-                heartbeat_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat_task
+                await self._maybe_finalize_candidate_receipt(candidate)
+                await safe_project_public_loop_activity(
+                    str(candidate["ticket_id"]),
+                    source_ref=f"candidate_stale_parent_during_scoring:{candidate_id}",
+                    reason=str(stale_result.get("status") or "stale_parent_during_scoring"),
+                    config=self.config,
+                )
+                try:
+                    await self._write_audit_bundle(evaluation_epoch)
+                except Exception:
+                    logger.exception("Research Lab audit bundle write failed after stale parent during scoring")
+                logger.info(
+                    format_worker_block(
+                        "RESEARCH LAB CANDIDATE STALE DURING SCORING",
+                        (
+                            ("Worker", self.worker_ref),
+                            ("Candidate", compact_ref(candidate_id)),
+                            ("Status", stale_result.get("status")),
+                            ("Derived candidate", compact_ref(stale_result.get("derived_candidate_id"))),
+                            ("Completed ICPs", stale_exc.progress.get("completed_icp_count", 0)),
+                            ("Elapsed", f"{time.time() - start:.1f}s"),
+                        ),
+                    )
+                )
+                return
             gate_result = score_bundle.get("private_holdout_gate")
             private_holdout_rejected = (
                 isinstance(gate_result, Mapping)
@@ -815,6 +1075,15 @@ class ResearchLabGatewayScoringWorker:
                     score_bundle=score_bundle,
                 )
             )
+            if promotion_result.get("status") == "stale_parent_needs_rescore":
+                promotion_result = await self._queue_stale_parent_rebase(
+                    candidate,
+                    active_artifact=(await load_active_private_model(self.config, register_bootstrap=True)).artifact,
+                    candidate_parent=str(candidate.get("parent_artifact_hash") or ""),
+                    evaluation_epoch=evaluation_epoch,
+                    elapsed_seconds=round(time.time() - start, 3),
+                    stage="after_scoring_parent_changed",
+                )
             await self._maybe_finalize_candidate_receipt(candidate)
             await safe_project_public_loop_activity(
                 str(candidate["ticket_id"]),
@@ -1088,22 +1357,160 @@ class ResearchLabGatewayScoringWorker:
         if candidate_parent == active_parent:
             return {"status": "current_parent"}
 
+        return await self._queue_stale_parent_rebase(
+            candidate,
+            active_artifact=active.artifact,
+            candidate_parent=candidate_parent,
+            evaluation_epoch=evaluation_epoch,
+            elapsed_seconds=elapsed_seconds(),
+            stage="before_scoring_parent_changed",
+        )
+
+    async def _queue_stale_parent_rebase(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        active_artifact: PrivateModelArtifactManifest,
+        candidate_parent: str,
+        evaluation_epoch: int,
+        elapsed_seconds: float,
+        stage: str,
+        stale_progress: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        active_parent = active_artifact.model_artifact_hash
+        candidate_id = str(candidate["candidate_id"])
+        rebase_depth = _stale_parent_rebase_depth(candidate)
+        next_rebase_depth = rebase_depth + 1
         base_event_doc = {
-            "action": "image_build_candidate_parent_changed_before_scoring",
+            "action": "image_build_candidate_parent_changed",
             "active_parent_artifact_hash": active_parent,
             "candidate_parent_artifact_hash": candidate_parent,
             "evaluation_epoch": int(evaluation_epoch),
             "worker_ref": self.worker_ref,
             "proxy_ref_hash": self.proxy_ref_hash,
+            "stage": stage,
+            "rebase_depth": rebase_depth,
+            "next_rebase_depth": next_rebase_depth,
+            "reimbursement_preserved": True,
+            "reimbursement_source": "hosted_loop_completion",
         }
+        if stale_progress:
+            base_event_doc["stale_progress"] = _stale_parent_progress_doc(stale_progress)
+        if not self.config.stale_parent_rebase_enabled:
+            await self._reject_stale_parent_candidate(
+                candidate,
+                base_event_doc=base_event_doc,
+                reason="stale_parent_needs_rescore",
+                elapsed_seconds=elapsed_seconds,
+            )
+            return {"status": "stale_parent_needs_rescore"}
+        if rebase_depth >= self.config.stale_parent_rebase_max_depth:
+            await self._reject_stale_parent_candidate(
+                candidate,
+                base_event_doc={
+                    **base_event_doc,
+                    "failure_class": "stale_parent_rebase_depth_exceeded",
+                    "max_rebase_depth": self.config.stale_parent_rebase_max_depth,
+                },
+                reason="stale_parent_rebase_failed",
+                elapsed_seconds=elapsed_seconds,
+            )
+            return {
+                "status": "stale_parent_rebase_failed",
+                "error": "stale_parent_rebase_depth_exceeded",
+            }
+
+        try:
+            draft = await asyncio.to_thread(self._draft_from_stale_candidate, candidate)
+            build = await asyncio.to_thread(
+                CodeEditCandidateBuilder(self.config).build,
+                draft=draft,
+                parent_artifact=active_artifact,
+                run_id=str(candidate["run_id"]),
+                candidate_index=await self._next_rebase_candidate_index(str(candidate["run_id"])),
+            )
+            repair_used = False
+        except CodeEditPatchApplyError as exc:
+            try:
+                draft, build = await self._repair_and_build_stale_candidate(
+                    candidate,
+                    active_artifact=active_artifact,
+                    original_error=exc,
+                    run_id=str(candidate["run_id"]),
+                )
+                repair_used = True
+            except Exception as repair_exc:
+                await self._reject_stale_parent_candidate(
+                    candidate,
+                    base_event_doc={
+                        **base_event_doc,
+                        "failure_class": "stale_parent_rebase_repair_failed",
+                        "error": str(repair_exc)[:500],
+                        "error_hash": sha256_json({"error": str(repair_exc)}),
+                    },
+                    reason="stale_parent_rebase_failed",
+                    elapsed_seconds=elapsed_seconds,
+                )
+                return {"status": "stale_parent_rebase_failed", "error": str(repair_exc)[:300]}
+        except Exception as exc:
+            await self._reject_stale_parent_candidate(
+                candidate,
+                base_event_doc={
+                    **base_event_doc,
+                    "failure_class": "stale_parent_rebase_failed",
+                    "error": str(exc)[:500],
+                    "error_hash": sha256_json({"error": str(exc)}),
+                },
+                reason="stale_parent_rebase_failed",
+                elapsed_seconds=elapsed_seconds,
+            )
+            return {"status": "stale_parent_rebase_failed", "error": str(exc)[:300]}
+
+        rebase_build_doc = {
+            **build.build_doc,
+            "stale_parent_rebase": {
+                "schema_version": "1.0",
+                "source_candidate_id": candidate_id,
+                "source_parent_artifact_hash": candidate_parent,
+                "rebased_parent_artifact_hash": active_parent,
+                "repair_used": repair_used,
+                "stage": stage,
+                "depth": next_rebase_depth,
+                "max_depth": self.config.stale_parent_rebase_max_depth,
+            },
+        }
+        request = ResearchLabCandidateArtifactCreateRequest(
+            run_id=str(candidate["run_id"]),
+            ticket_id=str(candidate["ticket_id"]),
+            receipt_id=str(candidate.get("receipt_id") or "") or None,
+            miner_hotkey=str(candidate["miner_hotkey"]),
+            island=str(candidate.get("island") or "generalist"),
+            candidate_kind="image_build",
+            private_model_manifest=active_artifact.to_dict(),
+            candidate_patch_manifest=build.code_edit_manifest,
+            candidate_model_manifest=build.candidate_model_manifest.to_dict(),
+            candidate_source_diff_hash=build.source_diff_hash,
+            candidate_build_doc=rebase_build_doc,
+            hypothesis_doc=dict(candidate.get("hypothesis_doc") or {}),
+            redacted_public_summary=str(candidate.get("redacted_public_summary") or draft.redacted_summary or ""),
+        )
+        derived_candidate, _event = await create_candidate_artifact(request)
+        derived_candidate_id = str(derived_candidate["candidate_id"])
         await create_candidate_promotion_event(
             candidate_id=candidate_id,
-            event_type="stale_parent_detected",
-            promotion_status="stale_parent_needs_rescore",
+            derived_candidate_id=derived_candidate_id,
+            event_type="rebase_queued",
+            promotion_status="rebenchmarking",
             active_parent_artifact_hash=active_parent,
             candidate_parent_artifact_hash=candidate_parent,
             worker_ref=self.worker_ref,
-            event_doc={**base_event_doc, "stage": "before_scoring"},
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": derived_candidate_id,
+                "derived_candidate_artifact_hash": build.candidate_model_manifest.model_artifact_hash,
+                "derived_source_diff_hash": build.source_diff_hash,
+                "repair_used": repair_used,
+            },
         )
         await create_candidate_evaluation_event(
             candidate_id=candidate_id,
@@ -1112,8 +1519,13 @@ class ResearchLabGatewayScoringWorker:
             event_type="rejected",
             candidate_status="rejected",
             evaluator_ref=self.worker_ref,
-            reason="stale_parent_needs_rescore",
-            event_doc={**base_event_doc, "elapsed_seconds": elapsed_seconds()},
+            reason="stale_parent_rebased_to_current",
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": derived_candidate_id,
+                "derived_source_diff_hash": build.source_diff_hash,
+                "elapsed_seconds": elapsed_seconds,
+            },
         )
         await create_scoring_dispatch_event(
             dispatch_type="candidate_scoring",
@@ -1123,9 +1535,175 @@ class ResearchLabGatewayScoringWorker:
             candidate_id=candidate_id,
             run_id=str(candidate["run_id"]),
             ticket_id=str(candidate["ticket_id"]),
-            event_doc={**base_event_doc, "reason": "stale_parent_needs_rescore"},
+            event_doc={
+                **base_event_doc,
+                "derived_candidate_id": derived_candidate_id,
+                "reason": "stale_parent_rebased_to_current",
+            },
         )
-        return {"status": "stale_parent_needs_rescore"}
+        return {
+            "status": "stale_parent_rebased_to_current",
+            "derived_candidate_id": derived_candidate_id,
+            "repair_used": repair_used,
+        }
+
+    async def _reject_stale_parent_candidate(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        base_event_doc: Mapping[str, Any],
+        reason: str,
+        elapsed_seconds: float,
+    ) -> None:
+        candidate_id = str(candidate["candidate_id"])
+        active_parent = str(base_event_doc.get("active_parent_artifact_hash") or "")
+        candidate_parent = str(base_event_doc.get("candidate_parent_artifact_hash") or "")
+        event_doc = {
+            "reimbursement_preserved": True,
+            "reimbursement_source": "hosted_loop_completion",
+            **dict(base_event_doc),
+        }
+        await create_candidate_promotion_event(
+            candidate_id=candidate_id,
+            event_type="stale_parent_detected",
+            promotion_status="rejected" if reason == "stale_parent_rebase_failed" else "rebase_required",
+            active_parent_artifact_hash=active_parent,
+            candidate_parent_artifact_hash=candidate_parent,
+            worker_ref=self.worker_ref,
+            event_doc=event_doc,
+        )
+        await create_candidate_evaluation_event(
+            candidate_id=candidate_id,
+            run_id=str(candidate["run_id"]),
+            ticket_id=str(candidate["ticket_id"]),
+            event_type="rejected",
+            candidate_status="rejected",
+            evaluator_ref=self.worker_ref,
+            reason=reason,
+            event_doc={**event_doc, "elapsed_seconds": elapsed_seconds},
+        )
+        await create_scoring_dispatch_event(
+            dispatch_type="candidate_scoring",
+            dispatch_status="rejected",
+            worker_ref=self.worker_ref,
+            proxy_ref_hash=self.proxy_ref_hash,
+            candidate_id=candidate_id,
+            run_id=str(candidate["run_id"]),
+            ticket_id=str(candidate["ticket_id"]),
+            event_doc={**event_doc, "reason": reason},
+        )
+
+    def _draft_from_stale_candidate(self, candidate: Mapping[str, Any]) -> CodeEditDraft:
+        unified_diff = _load_candidate_source_diff(candidate)
+        patch = candidate.get("candidate_patch_manifest")
+        patch_doc = patch.get("patch_doc") if isinstance(patch, Mapping) else {}
+        if not isinstance(patch_doc, Mapping):
+            patch_doc = {}
+        hypothesis = candidate.get("hypothesis_doc") if isinstance(candidate.get("hypothesis_doc"), Mapping) else {}
+        patch_summary = str(patch.get("redacted_summary") or "") if isinstance(patch, Mapping) else ""
+        target_files = patch_doc.get("target_files")
+        if not isinstance(target_files, list) or not target_files:
+            target_files = sorted(_extract_diff_paths_safe(unified_diff))
+        return CodeEditDraft(
+            failure_mode=str(hypothesis.get("failure_mode") or "Previously generated miner code edit")[:700],
+            mechanism=str(hypothesis.get("mechanism") or patch_doc.get("expected_improvement") or "")[:1000],
+            expected_improvement=str(hypothesis.get("expected_improvement") or patch_doc.get("expected_improvement") or "")[:1000],
+            risk=str(hypothesis.get("risk") or patch_doc.get("risk") or "")[:700],
+            lane=str(patch_doc.get("lane") or "stale_parent_rebase")[:80],
+            target_files=tuple(str(path) for path in target_files),
+            unified_diff=unified_diff,
+            redacted_summary=str(candidate.get("redacted_public_summary") or patch_summary)[:1200],
+            test_plan=str(patch_doc.get("test_plan") or "Run the standard Research Lab private test command.")[:1200],
+            rollback_plan=str(patch_doc.get("rollback_plan") or "Discard the rebased candidate image.")[:1200],
+            predicted_delta=float(hypothesis.get("predicted_delta") or 1.0),
+        )
+
+    async def _repair_and_build_stale_candidate(
+        self,
+        candidate: Mapping[str, Any],
+        *,
+        active_artifact: PrivateModelArtifactManifest,
+        original_error: CodeEditPatchApplyError,
+        run_id: str,
+    ) -> tuple[CodeEditDraft, Any]:
+        if not self.config.stale_parent_rebase_repair_enabled:
+            raise original_error
+        api_key = os.getenv("RESEARCH_LAB_STALE_PARENT_REBASE_OPENROUTER_API_KEY") or os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise CodeEditBuildError("stale parent repair OpenRouter operator key is not configured")
+        model_id = str(self.config.stale_parent_rebase_repair_model or "").strip()
+        if not model_id:
+            raise CodeEditBuildError("stale parent repair model is not configured")
+
+        original_draft = await asyncio.to_thread(self._draft_from_stale_candidate, candidate)
+        builder = CodeEditCandidateBuilder(self.config)
+        with tempfile.TemporaryDirectory(prefix="research-lab-stale-rebase-") as tmp:
+            source_context = await asyncio.to_thread(
+                builder.prepare_parent_source_context,
+                parent_artifact=active_artifact,
+                workspace_dir=Path(tmp),
+            )
+            read_batch = resolve_source_inspection_requests(
+                source_context,
+                [
+                    CodeEditSourceInspectionRequest(
+                        operation="read_file",
+                        path=path,
+                        rationale="repair stale parent code-edit diff against current model source",
+                    )
+                    for path in original_draft.target_files
+                ],
+                already_read_paths=(),
+                max_files=max(len(original_draft.target_files), self.config.code_edit_source_inspection_max_files),
+                max_file_bytes=self.config.code_edit_source_inspection_file_bytes,
+                max_total_bytes=self.config.code_edit_source_inspection_total_bytes,
+                max_search_matches=self.config.code_edit_source_inspection_search_matches,
+            )
+            raw = await _call_operator_openrouter_json(
+                api_key=api_key,
+                model_id=model_id,
+                messages=build_code_edit_repair_messages(
+                    draft=original_draft,
+                    apply_error=str(original_error),
+                    source_inspection_context=read_batch.model_context,
+                    runtime_source_context=source_context.prompt_context(),
+                    budget_context={
+                        "repair_context": "stale_parent_rebase",
+                        "operator_funded": True,
+                    },
+                    repair_attempt=1,
+                    max_candidates=1,
+                ),
+                timeout_seconds=self.config.stale_parent_rebase_repair_timeout_seconds,
+            )
+            repaired = parse_code_edit_repair_response(raw, original_draft=original_draft)[0]
+            source_errors = builder.validate_draft_against_source_context(
+                repaired,
+                source_context,
+                read_paths=read_batch.read_paths,
+                require_read=True,
+            )
+            if source_errors:
+                raise CodeEditBuildError("; ".join(source_errors))
+            candidate_index = await self._next_rebase_candidate_index(run_id)
+            build = await asyncio.to_thread(
+                builder.build,
+                draft=repaired,
+                parent_artifact=active_artifact,
+                run_id=run_id,
+                candidate_index=candidate_index,
+                source_context=source_context,
+            )
+            return repaired, build
+
+    async def _next_rebase_candidate_index(self, run_id: str) -> int:
+        rows = await select_many(
+            "research_lab_candidate_evaluation_current",
+            columns="candidate_id",
+            filters=(("run_id", str(run_id)),),
+            limit=1000,
+        )
+        return 1000 + len(rows)
 
     async def _candidate_private_holdout_gate(
         self,
