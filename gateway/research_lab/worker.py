@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -22,7 +23,7 @@ from gateway.research_lab.chain import resolve_research_lab_evaluation_epoch
 from gateway.research_lab.code_build import CodeEditCandidateBuilder
 from gateway.research_lab.code_loop_engine import CodeEditLoopEngine
 from gateway.research_lab.config import DEFAULT_ACTIVE_LOOP_STALE_AFTER_SECONDS, ResearchLabGatewayConfig
-from gateway.research_lab.key_vault import OpenRouterKeyVaultError, decrypt_openrouter_key
+from gateway.research_lab.key_vault import OpenRouterKeyVaultError, decrypt_openrouter_key, preflight_openrouter_key
 from gateway.research_lab.logging_utils import compact_ref, format_worker_block, format_worker_line
 from gateway.research_lab.loop_engine import (
     AutoResearchLoopEvent,
@@ -112,6 +113,10 @@ class RetryableHostedResearchLabWorkerError(HostedResearchLabWorkerError):
 
 class HostedResearchLabBuilderNotReady(RetryableHostedResearchLabWorkerError):
     """Raised when image-build candidate infrastructure is not ready yet."""
+
+
+class OpenRouterCreditBlockedError(HostedResearchLabWorkerError):
+    """Raised when a miner OpenRouter key cannot currently fund more model calls."""
 
 
 class HostedResearchLabClaimLost(HostedResearchLabWorkerError):
@@ -221,6 +226,13 @@ _OPENROUTER_PERMANENT_ERROR_MARKERS = (
     "insufficient balance",
     "payment required",
 )
+_OPENROUTER_CREDIT_BLOCK_MARKERS = (
+    "insufficient credits",
+    "insufficient balance",
+    "payment required",
+    "credit limit",
+    "limit remaining",
+)
 _OPENROUTER_TRANSIENT_ERROR_MARKERS = (
     "no candidate-generation choices",
     "empty candidate-generation content",
@@ -274,6 +286,8 @@ def _raise_openrouter_generation_response_error(
 ) -> None:
     summary = _openrouter_response_summary(decoded)
     error = f"OpenRouter candidate generation failed: {failure}: {summary}"
+    if _is_openrouter_credit_block_message(error):
+        raise OpenRouterCreditBlockedError(error)
     if _openrouter_generation_response_is_retryable(
         decoded,
         error,
@@ -281,6 +295,11 @@ def _raise_openrouter_generation_response_error(
     ):
         raise RetryableHostedResearchLabWorkerError(error)
     raise HostedResearchLabWorkerError(error)
+
+
+def _is_openrouter_credit_block_message(message: object) -> bool:
+    lowered = str(message or "").lower()
+    return any(marker in lowered for marker in _OPENROUTER_CREDIT_BLOCK_MARKERS)
 
 
 def _openrouter_generation_response_is_retryable(
@@ -362,6 +381,13 @@ def _redact_openrouter_diagnostic(value: str, *, limit: int) -> str:
     if any(marker in lowered for marker in secret_markers):
         return "[redacted secret-like diagnostic text]"
     return text[: max(1, int(limit))]
+
+
+def _redacted_ref(value: object) -> str:
+    text = str(value or "")
+    if len(text) <= 16:
+        return text
+    return f"{text[:10]}...{text[-6:]}"
 
 
 @dataclass(frozen=True)
@@ -622,6 +648,19 @@ class ResearchLabHostedWorker:
                 )
             )
             return await self._mark_builder_not_ready(context, str(exc))
+        except OpenRouterCreditBlockedError as exc:
+            logger.warning(
+                format_worker_block(
+                    "RESEARCH LAB AUTO-RESEARCH BLOCKED FOR OPENROUTER CREDIT",
+                    (
+                        ("Worker", self.worker_ref),
+                        ("Run", compact_ref(run_id)),
+                        ("Ticket", compact_ref(ticket_id)),
+                        ("Reason", str(exc)[:300]),
+                    ),
+                )
+            )
+            return await self._mark_credit_blocked(context, str(exc))
         except Exception as exc:
             if _is_retryable_worker_exception(exc):
                 retry_count = _retryable_requeue_count(context)
@@ -947,6 +986,7 @@ class ResearchLabHostedWorker:
         )
         provider_env = dict(resolved_openrouter_env)
         context.provider_env = provider_env
+        await self._preflight_openrouter_credit(context, provider_env["OPENROUTER_API_KEY"])
         docker_provider_env = _private_model_docker_env(
             self.config,
             {
@@ -963,6 +1003,9 @@ class ResearchLabHostedWorker:
 
         active_start = await load_active_private_model(self.config, register_bootstrap=True)
         artifact = active_start.artifact
+        outcome_memory = await self._active_parent_outcome_memory(artifact)
+        if outcome_memory:
+            budget_context["active_parent_outcome_memory"] = outcome_memory
 
         def _load_runtime_metadata() -> Mapping[str, Any]:
             runner = DockerPrivateModelRunner(
@@ -1396,6 +1439,19 @@ class ResearchLabHostedWorker:
                 },
             )
         except Exception as exc:
+            after = await select_one(
+                "research_lab_auto_research_loop_current",
+                columns="run_id,current_loop_status,current_event_type,current_event_seq,current_event_hash",
+                filters=(("run_id", context.run_id),),
+            )
+            if after and str(after.get("current_loop_status") or "") == loop_status:
+                logger.info(
+                    "research_lab_terminal_loop_projection_insert_uncertain_but_projected run_id=%s event_type=%s event_hash=%s",
+                    compact_ref(context.run_id),
+                    event_type,
+                    after.get("current_event_hash"),
+                )
+                return
             logger.warning(
                 "research_lab_terminal_loop_projection_failed run_id=%s event_type=%s error=%s",
                 compact_ref(context.run_id),
@@ -1950,6 +2006,107 @@ class ResearchLabHostedWorker:
             )
         return await task
 
+    async def _preflight_openrouter_credit(self, context: HostedRunContext, api_key: str) -> None:
+        try:
+            doc = await asyncio.to_thread(preflight_openrouter_key, api_key)
+        except OpenRouterKeyVaultError as exc:
+            message = str(exc)
+            lowered = message.lower()
+            if "invalid or unauthorized" in lowered or "disabled" in lowered:
+                raise HostedResearchLabWorkerError(f"OpenRouter key preflight failed permanently: {message}") from exc
+            logger.warning(
+                "research_lab_openrouter_credit_preflight_unavailable run_id=%s key_ref=%s error=%s",
+                compact_ref(context.run_id),
+                _redacted_ref(_miner_openrouter_key_ref(context)),
+                message[:240],
+            )
+            return
+        remaining = doc.get("limit_remaining")
+        try:
+            remaining_value = float(remaining) if remaining is not None else None
+        except (TypeError, ValueError):
+            remaining_value = None
+        if remaining_value is not None and remaining_value <= 0:
+            raise OpenRouterCreditBlockedError(
+                "OpenRouter key credit preflight blocked execution: limit_remaining <= 0"
+            )
+
+    async def _mark_credit_blocked(self, context: HostedRunContext, error: str) -> HostedWorkerOutcome:
+        checkpoint = await latest_auto_research_checkpoint(context.run_id)
+        event_doc = {
+            **autoresearch_queue_capacity_doc(self.config),
+            "schema_version": "1.0",
+            "run_id": context.run_id,
+            "worker_ref": self.worker_ref,
+            "credit_blocked": True,
+            "failure_class": "openrouter_credit_blocked",
+            "error": _redact_openrouter_diagnostic(error, limit=500),
+            "previous_event_hash": context.queue_row.get("current_event_hash"),
+            "previous_status_at": context.queue_row.get("current_status_at"),
+            "checkpoint_hash": checkpoint.get("checkpoint_hash") if isinstance(checkpoint, Mapping) else None,
+        }
+        if context.receipt_id:
+            try:
+                await create_receipt_event(
+                    receipt_id=context.receipt_id,
+                    ticket_id=context.ticket_id,
+                    event_type="queued",
+                    receipt_status="queued",
+                    event_doc=event_doc,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "research_lab_credit_blocked_receipt_event_failed run_id=%s receipt_id=%s error=%s",
+                    compact_ref(context.run_id),
+                    compact_ref(context.receipt_id),
+                    str(exc)[:240],
+                )
+        await create_queue_event(
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            event_type="paused",
+            queue_priority=int(context.queue_row.get("queue_priority") or 0),
+            worker_ref=self.worker_ref,
+            reason="blocked_for_credit",
+            event_doc=event_doc,
+        )
+        await self._ensure_terminal_loop_projection(
+            context,
+            event_type="loop_paused",
+            loop_status="paused",
+            reason="blocked_for_credit",
+            event_doc=event_doc,
+        )
+        try:
+            await create_ticket_event(
+                ticket_id=context.ticket_id,
+                event_type="running",
+                actor_hotkey=None,
+                reason="blocked_for_credit",
+                event_doc=event_doc,
+            )
+            await safe_project_public_loop_activity(
+                context.ticket_id,
+                source_ref=f"hosted_worker_credit_blocked:{context.run_id}",
+                reason="blocked_for_credit",
+                config=self.config,
+            )
+        except Exception as exc:
+            logger.warning(
+                "research_lab_credit_blocked_noncritical_projection_failed run_id=%s error=%s",
+                compact_ref(context.run_id),
+                str(exc)[:240],
+            )
+        return HostedWorkerOutcome(
+            processed=True,
+            dry_run=False,
+            run_id=context.run_id,
+            ticket_id=context.ticket_id,
+            status="blocked_for_credit",
+            receipt_id=context.receipt_id,
+            error=error[:500],
+        )
+
     async def _mark_failed(self, context: HostedRunContext, error: str) -> HostedWorkerOutcome:
         event_doc = {"run_id": context.run_id, "worker_ref": self.worker_ref, "error": error[:500]}
         receipt_id = context.receipt_id
@@ -2259,6 +2416,8 @@ class ResearchLabHostedWorker:
             except HTTPError as exc:
                 message = exc.read().decode("utf-8", errors="replace")[:500]
                 error = f"OpenRouter candidate generation failed: HTTP {exc.code}: {message}"
+                if int(exc.code) == 402 or _is_openrouter_credit_block_message(error):
+                    raise OpenRouterCreditBlockedError(error) from exc
                 if int(exc.code) in _RETRYABLE_HTTP_CODES:
                     raise RetryableHostedResearchLabWorkerError(error) from exc
                 raise HostedResearchLabWorkerError(error) from exc
@@ -2349,6 +2508,134 @@ class ResearchLabHostedWorker:
         budget = float(budget_context.get("requested_compute_budget_usd") or self.config.default_compute_budget_usd)
         budget_limited = max(1, min(configured, int(max(1.0, budget // max(1.0, self.config.min_compute_budget_usd)))))
         return max(1, min(self.config.hosted_worker_max_candidates, budget_limited))
+
+    async def _active_parent_outcome_memory(
+        self,
+        artifact: Any,
+        *,
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        parent_hash = str(getattr(artifact, "model_artifact_hash", "") or "")
+        if not parent_hash:
+            return {}
+        try:
+            candidates = await select_many(
+                "research_lab_candidate_evaluation_current",
+                columns=(
+                    "candidate_id,run_id,parent_artifact_hash,current_candidate_status,current_reason,"
+                    "current_score_bundle_id,candidate_patch_manifest,redacted_public_summary,created_at,current_status_at"
+                ),
+                filters=(("parent_artifact_hash", parent_hash),),
+                order_by=(("created_at", True),),
+                limit=max(1, min(limit, 200)),
+            )
+            score_bundles = await select_many(
+                "research_evaluation_score_bundle_current",
+                columns="score_bundle_id,candidate_artifact_hash,parent_artifact_hash,score_bundle_doc,created_at",
+                filters=(("parent_artifact_hash", parent_hash),),
+                order_by=(("created_at", True),),
+                limit=max(1, min(limit, 200)),
+            )
+            promotion_events = await select_many(
+                "research_lab_candidate_promotion_events",
+                columns="candidate_id,event_type,promotion_status,event_doc,created_at",
+                order_by=(("created_at", True),),
+                limit=max(1, min(limit * 2, 400)),
+            )
+        except Exception as exc:
+            logger.warning("research_lab_active_parent_outcome_memory_unavailable: %s", str(exc)[:200])
+            return {}
+
+        candidate_ids = {str(row.get("candidate_id") or "") for row in candidates}
+        candidate_ids.discard("")
+        lane_counts: Counter[str] = Counter()
+        target_file_counts: Counter[str] = Counter()
+        status_counts: Counter[str] = Counter()
+        reason_counts: Counter[str] = Counter()
+        failure_class_counts: Counter[str] = Counter()
+        for row in candidates:
+            status = str(row.get("current_candidate_status") or "unknown")
+            reason = str(row.get("current_reason") or "")
+            status_counts[status] += 1
+            if reason:
+                reason_counts[reason] += 1
+            lane, files = _candidate_lane_and_files(row.get("candidate_patch_manifest"))
+            lane_counts[lane] += 1
+            for path in files:
+                target_file_counts[path] += 1
+            failure_class = _candidate_failure_class_for_memory(row)
+            if failure_class:
+                failure_class_counts[failure_class] += 1
+
+        promotion_counts: Counter[str] = Counter()
+        public_holdout_rejected = 0
+        for row in promotion_events:
+            candidate_id = str(row.get("candidate_id") or "")
+            if candidate_id and candidate_id not in candidate_ids:
+                continue
+            event_type = str(row.get("event_type") or "")
+            if event_type:
+                promotion_counts[event_type] += 1
+            if event_type == "public_holdout_rejected":
+                public_holdout_rejected += 1
+
+        scored_count = 0
+        positive_delta_count = 0
+        nonpositive_delta_count = 0
+        best_mean_delta: float | None = None
+        worst_mean_delta: float | None = None
+        best_delta_lcb: float | None = None
+        score_health_counts: Counter[str] = Counter()
+        for row in score_bundles:
+            doc = row.get("score_bundle_doc") if isinstance(row.get("score_bundle_doc"), Mapping) else {}
+            aggregates = doc.get("aggregates") if isinstance(doc.get("aggregates"), Mapping) else {}
+            if not aggregates:
+                continue
+            scored_count += 1
+            mean_delta = _safe_float_for_memory(aggregates.get("mean_delta"))
+            delta_lcb = _safe_float_for_memory(aggregates.get("delta_lcb"))
+            if mean_delta > 0:
+                positive_delta_count += 1
+            else:
+                nonpositive_delta_count += 1
+            best_mean_delta = mean_delta if best_mean_delta is None else max(best_mean_delta, mean_delta)
+            worst_mean_delta = mean_delta if worst_mean_delta is None else min(worst_mean_delta, mean_delta)
+            best_delta_lcb = delta_lcb if best_delta_lcb is None else max(best_delta_lcb, delta_lcb)
+            health = doc.get("scoring_health") if isinstance(doc.get("scoring_health"), Mapping) else {}
+            score_health_counts[str(health.get("health_status") or "unknown")] += 1
+
+        guidance: list[str] = []
+        if failure_class_counts:
+            guidance.append("Avoid repeating recently failed provider/runtime failure modes.")
+        if public_holdout_rejected:
+            guidance.append("Public holdout rejected recent candidates; prefer changes likely to improve public-visible ICP quality before private holdout.")
+        if nonpositive_delta_count >= positive_delta_count and scored_count:
+            guidance.append("Recent scored candidates had weak or negative deltas; prefer narrow, testable code edits over broad prompt rewrites.")
+
+        return {
+            "schema_version": "1.0",
+            "source": "active_parent_recent_outcome_memory",
+            "active_parent_artifact_hash": parent_hash,
+            "sampled_candidate_count": len(candidates),
+            "sampled_score_bundle_count": scored_count,
+            "candidate_status_counts": _top_counter(status_counts, limit=8),
+            "candidate_reason_counts": _top_counter(reason_counts, limit=8),
+            "promotion_decision_counts": _top_counter(promotion_counts, limit=8),
+            "public_holdout_rejected_count": public_holdout_rejected,
+            "lane_counts": _top_counter(lane_counts, limit=8),
+            "target_file_counts": _top_counter(target_file_counts, limit=8),
+            "failure_class_counts": _top_counter(failure_class_counts, limit=8),
+            "score_bundle_health_counts": _top_counter(score_health_counts, limit=8),
+            "scored_delta_summary": {
+                "count": scored_count,
+                "positive_count": positive_delta_count,
+                "negative_or_zero_count": nonpositive_delta_count,
+                "best_mean_delta": round(best_mean_delta, 6) if best_mean_delta is not None else None,
+                "worst_mean_delta": round(worst_mean_delta, 6) if worst_mean_delta is not None else None,
+                "best_delta_lcb": round(best_delta_lcb, 6) if best_delta_lcb is not None else None,
+            },
+            "guidance": guidance[:4],
+        }
 
 
 def _miner_openrouter_key_ref(context: HostedRunContext) -> str:
@@ -2477,6 +2764,59 @@ def _redacted_budget_context(value: Mapping[str, Any]) -> dict[str, Any]:
         "topup_reason",
     }
     return {key: value[key] for key in allowed if key in value}
+
+
+def _candidate_lane_and_files(value: Any) -> tuple[str, tuple[str, ...]]:
+    manifest = value if isinstance(value, Mapping) else {}
+    patch_doc = manifest.get("patch_doc") if isinstance(manifest.get("patch_doc"), Mapping) else {}
+    code_edit = patch_doc.get("code_edit") if isinstance(patch_doc.get("code_edit"), Mapping) else {}
+    lane = str(code_edit.get("lane") or patch_doc.get("lane") or "unknown").strip() or "unknown"
+    raw_files = code_edit.get("target_files") or patch_doc.get("target_files") or ()
+    files: list[str] = []
+    if isinstance(raw_files, Sequence) and not isinstance(raw_files, (str, bytes, bytearray)):
+        for item in raw_files:
+            path = str(item or "").strip()
+            if path and not _looks_secret_like(path):
+                files.append(path[:160])
+    return lane[:80], tuple(files[:12])
+
+
+def _candidate_failure_class_for_memory(row: Mapping[str, Any]) -> str:
+    reason = str(row.get("current_reason") or "")
+    if reason:
+        return reason[:120]
+    status = str(row.get("current_candidate_status") or "")
+    return status[:120] if status in {"failed", "rejected"} else ""
+
+
+def _top_counter(counter: Counter[str], *, limit: int) -> dict[str, int]:
+    return {
+        str(key)[:160]: int(value)
+        for key, value in counter.most_common(max(0, limit))
+        if key
+    }
+
+
+def _safe_float_for_memory(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _looks_secret_like(value: str) -> bool:
+    lowered = value.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "sk-or-",
+            "service_role",
+            "api_key",
+            "secret",
+            "proxy",
+            "://",
+        )
+    )
 
 
 def _validator_evaluation_summary() -> dict[str, Any]:
