@@ -314,7 +314,6 @@ async def project_public_loop_activity(
         score_bundle_rows=score_bundle_rows,
         promotion_event_rows=promotion_event_rows,
         improvement_threshold_points=effective_config.improvement_threshold_points,
-        improvement_min_delta_lcb=effective_config.improvement_min_delta_lcb,
     )
     event_ref = public_loop_card_event_ref(ticket_id, source_ref, outcome.outcome_label, outcome.last_activity_at)
     event = await create_public_loop_card_event(
@@ -370,7 +369,6 @@ def derive_public_loop_outcome(
     score_bundle_rows: Sequence[Mapping[str, Any]],
     promotion_event_rows: Sequence[Mapping[str, Any]],
     improvement_threshold_points: float = 1.0,
-    improvement_min_delta_lcb: float = 0.0,
 ) -> PublicLoopOutcome:
     candidate_count = len(candidate_rows)
     status_counts = _status_counts(candidate_rows, "current_candidate_status")
@@ -516,8 +514,8 @@ def derive_public_loop_outcome(
             return _result("waiting_for_baseline", "waiting_for_baseline", "pending")
         return _result("scoring", "scoring", "pending")
     if scored_candidate_count:
-        mean_delta, delta_lcb = _score_bundle_delta(best_bundle)
-        if mean_delta >= float(improvement_threshold_points) and delta_lcb >= float(improvement_min_delta_lcb):
+        mean_delta, _delta_lcb = _score_bundle_delta(best_bundle)
+        if mean_delta >= float(improvement_threshold_points):
             return PublicLoopOutcome(
                 "scored",
                 "scored_promising",
@@ -574,6 +572,32 @@ def derive_public_loop_outcome(
             event_doc,
         )
     if not queue_rows and not receipt_rows and not candidate_rows:
+        # A ticket in `opened` with no run/queue/receipt/candidate never had its
+        # loop-start payment: opening a ticket only declares intent; the loop is
+        # launched by a separate paid loop-start call that writes the first
+        # `paid_loop_queued` queue event. Surface this as its own stage so the
+        # dashboard distinguishes "miner has not paid to launch" from a run the
+        # platform simply has not picked up yet.
+        if ticket_status == "opened":
+            # Emit the canonical lifecycle fields the dashboard consumes
+            # (public_status / payment_state) so it renders the "Awaiting payment"
+            # stage from the canonical path rather than inferring it from the legacy
+            # outcome label. `no_payment` is what maps to Awaiting payment downstream.
+            awaiting_event_doc = dict(event_doc)
+            awaiting_event_doc["public_status"] = "awaiting_payment"
+            awaiting_event_doc["payment_state"] = "no_payment"
+            return PublicLoopOutcome(
+                "awaiting_payment",
+                "awaiting_payment",
+                "pending",
+                candidate_count,
+                scored_candidate_count,
+                best_summary,
+                run_id,
+                receipt_id,
+                last_activity_at,
+                awaiting_event_doc,
+            )
         return PublicLoopOutcome(
             "not_started",
             "not_started",
