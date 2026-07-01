@@ -142,6 +142,48 @@ def main() -> int:
         finally:
             worker_module.urlrequest.urlopen = original_urlopen
 
+        flaky_calls = {"count": 0}
+        original_attempts = os.environ.get("RESEARCH_LAB_OPENROUTER_GENERATION_ATTEMPTS")
+
+        def _fake_flaky_then_success(_request, timeout: int):
+            url = str(getattr(_request, "full_url", "") or "")
+            if "/api/v1/generation" in url:
+                return _FakeOpenRouterResponse({"data": {"id": "gen-flaky-success", "total_cost": 0.000001}})
+            flaky_calls["count"] += 1
+            if flaky_calls["count"] == 1:
+                return _FakeOpenRouterResponse({"id": "gen-flaky-empty", "model": "test/model", "choices": []})
+            return _FakeOpenRouterResponse(
+                {
+                    "id": "gen-flaky-success",
+                    "model": "test/model",
+                    "choices": [{"finish_reason": "stop", "message": {"content": '{"candidates":[]}'}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                }
+            )
+
+        os.environ["RESEARCH_LAB_OPENROUTER_GENERATION_ATTEMPTS"] = "2"
+        worker_module.urlrequest.urlopen = _fake_flaky_then_success
+        try:
+            result = await hosted_worker._call_openrouter(
+                messages=[{"role": "user", "content": '{"task":"test"}'}],
+                api_key=fake_key,
+                model_id="test/model",
+                timeout_seconds=7,
+                max_tokens=16,
+            )
+            if flaky_calls["count"] != 2:
+                errors.append("OpenRouter retry did not retry transient no-choices response exactly once")
+            if result.content != '{"candidates":[]}':
+                errors.append("OpenRouter retry did not return successful retry content")
+        except Exception as exc:
+            errors.append(f"OpenRouter transient retry did not recover: {exc}")
+        finally:
+            worker_module.urlrequest.urlopen = original_urlopen
+            if original_attempts is None:
+                os.environ.pop("RESEARCH_LAB_OPENROUTER_GENERATION_ATTEMPTS", None)
+            else:
+                os.environ["RESEARCH_LAB_OPENROUTER_GENERATION_ATTEMPTS"] = original_attempts
+
         captured_reasoning_body: dict[str, object] = {}
 
         def _fake_reasoning_request(_request, timeout: int):
@@ -257,7 +299,7 @@ def main() -> int:
     if tier_model != "z-ai/glm-5.2" or tier_doc.get("reasoning_effort") != "xhigh":
         errors.append("approved auto-research model tier did not preserve reasoning_effort")
     provider_usage, reconciled_cost = _build_openrouter_provider_usage(
-        decoded={"id": "gen-test-1", "model": "test/model"},
+        decoded={"id": "gen-test-1", "model": "test/model", "choices": [{"finish_reason": "stop"}]},
         usage={"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30, "cost": 0.000111},
         model_id="fallback/model",
         api_key="test-openrouter-api-key",
@@ -284,6 +326,8 @@ def main() -> int:
         errors.append("OpenRouter provider usage did not preserve usage-vs-generation cost delta")
     if not isinstance(provider_usage.get("generation_stats"), dict) or provider_usage["generation_stats"].get("provider_name") != "test-provider":
         errors.append("OpenRouter provider usage did not store sanitized generation stats")
+    if provider_usage.get("finish_reason") != "stop":
+        errors.append("OpenRouter provider usage did not preserve finish_reason")
 
     artifact = _artifact()
     registry = coerce_component_registry(_metadata())
