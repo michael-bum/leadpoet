@@ -949,6 +949,42 @@ class ResearchLabPromotionController:
         active = await load_active_private_model(self.config, register_bootstrap=True)
         active_parent = active.artifact.model_artifact_hash
 
+        # Re-drive idempotency: a candidate that already merged must never
+        # merge again, and replay must not insert duplicate promotion_checked
+        # events. Checked before the stale-parent branch because a merged
+        # candidate's own merge makes its parent stale.
+        merged_event = await candidate_already_promoted(str(candidate["candidate_id"]))
+        if merged_event is not None:
+            logger.info(
+                "research_lab_promotion_already_promoted candidate=%s promotion_event=%s",
+                _short_ref(candidate["candidate_id"]),
+                _short_ref(merged_event.get("promotion_event_id")),
+            )
+            private_source_status = await self._maybe_finalize_missing_private_source_push(
+                candidate=candidate,
+                score_bundle_row=score_bundle_row,
+                score_bundle=score_bundle,
+                active=active,
+                candidate_parent=candidate_parent,
+                rolling_window_hash=rolling_window_hash,
+                improvement_points=improvement_points,
+                threshold=threshold,
+            )
+            reward_status = await self._maybe_finalize_missing_champion_reward(
+                candidate=candidate,
+                score_bundle_row=score_bundle_row,
+                score_bundle=score_bundle,
+                improvement_points=improvement_points,
+                threshold=threshold,
+            )
+            return {
+                "status": "already_promoted",
+                "promotion_event_id": str(merged_event.get("promotion_event_id") or ""),
+                "private_model_version_id": str(merged_event.get("private_model_version_id") or ""),
+                "private_source_status": private_source_status,
+                **reward_status,
+            }
+
         await create_candidate_promotion_event(
             candidate_id=str(candidate["candidate_id"]),
             source_score_bundle_id=score_bundle_id,
@@ -1028,41 +1064,6 @@ class ResearchLabPromotionController:
                 },
             )
             return {"status": "rejected_below_threshold"}
-
-        # Re-drive idempotency: a candidate that already merged must never
-        # merge again. Checked before the stale-parent branch because a merged
-        # candidate's own merge makes its parent stale.
-        merged_event = await candidate_already_promoted(str(candidate["candidate_id"]))
-        if merged_event is not None:
-            logger.info(
-                "research_lab_promotion_already_promoted candidate=%s promotion_event=%s",
-                _short_ref(candidate["candidate_id"]),
-                _short_ref(merged_event.get("promotion_event_id")),
-            )
-            private_source_status = await self._maybe_finalize_missing_private_source_push(
-                candidate=candidate,
-                score_bundle_row=score_bundle_row,
-                score_bundle=score_bundle,
-                active=active,
-                candidate_parent=candidate_parent,
-                rolling_window_hash=rolling_window_hash,
-                improvement_points=improvement_points,
-                threshold=threshold,
-            )
-            reward_status = await self._maybe_finalize_missing_champion_reward(
-                candidate=candidate,
-                score_bundle_row=score_bundle_row,
-                score_bundle=score_bundle,
-                improvement_points=improvement_points,
-                threshold=threshold,
-            )
-            return {
-                "status": "already_promoted",
-                "promotion_event_id": str(merged_event.get("promotion_event_id") or ""),
-                "private_model_version_id": str(merged_event.get("private_model_version_id") or ""),
-                "private_source_status": private_source_status,
-                **reward_status,
-            }
 
         if candidate_parent != active_parent:
             await create_candidate_promotion_event(
@@ -1451,8 +1452,17 @@ class ResearchLabPromotionController:
                 "branch_name": branch_name,
             }
         )
+        existing_attempt_events = await select_many(
+            "research_lab_private_repo_commit_events",
+            columns="commit_event_id,commit_status,created_at",
+            filters=(("candidate_id", candidate_id), ("score_bundle_id", score_bundle_id)),
+            order_by=(("created_at", True),),
+            limit=100,
+        )
+        source_push_attempt = len(existing_attempt_events) + 1
         event_base = {
             "source": "research_lab_source_push",
+            "source_push_attempt": source_push_attempt,
             "candidate_kind": "image_build",
             "candidate_model_artifact_hash": new_artifact.model_artifact_hash,
             "candidate_source_diff_hash": candidate.get("candidate_source_diff_hash"),
@@ -1520,6 +1530,7 @@ class ResearchLabPromotionController:
                     "error_hash": error_hash,
                     "error_class": type(exc).__name__,
                     "candidate_status_preserved": "scored",
+                    "source_push_attempt": source_push_attempt,
                     **failure_detail,
                 },
             )
@@ -1637,13 +1648,17 @@ class ResearchLabPromotionController:
             columns="commit_event_id,commit_status,git_commit_sha,created_at",
             filters=(("candidate_id", candidate_id), ("score_bundle_id", score_bundle_id)),
             order_by=(("created_at", True),),
-            limit=1,
+            limit=10,
         )
-        if existing_events:
+        successful_events = [
+            event for event in existing_events if str(event.get("commit_status") or "") in {"committed", "pushed"}
+        ]
+        if successful_events:
+            event = successful_events[0]
             return {
                 "status": "already_recorded",
-                "commit_status": str(existing_events[0].get("commit_status") or ""),
-                "commit_event_id": str(existing_events[0].get("commit_event_id") or ""),
+                "commit_status": str(event.get("commit_status") or ""),
+                "commit_event_id": str(event.get("commit_event_id") or ""),
             }
         if not self.config.auto_commit_enabled:
             return {"status": "skipped_auto_commit_disabled"}
@@ -1917,8 +1932,21 @@ def _push_candidate_source_diff_to_repo(
                 raise RepoHeadMismatchError(head=head, expected_sha=active_sha)
 
         patch_path = tmp_dir / "candidate.patch"
-        patch_path.write_text(unified_diff, encoding="utf-8")
+        patch_text = unified_diff
+        patch_normalized = False
+        patch_path.write_text(patch_text, encoding="utf-8")
         check = _run_command_result(["git", "apply", "--check", str(patch_path)], cwd=worktree, timeout_seconds=30)
+        if check.returncode != 0 and "corrupt patch" in ((check.stderr or "") + (check.stdout or "")):
+            normalized = _normalize_unified_diff_hunk_headers(patch_text)
+            if normalized != patch_text:
+                patch_text = normalized
+                patch_normalized = True
+                patch_path.write_text(patch_text, encoding="utf-8")
+                check = _run_command_result(
+                    ["git", "apply", "--check", str(patch_path)],
+                    cwd=worktree,
+                    timeout_seconds=30,
+                )
         if check.returncode != 0:
             reverse = _run_command_result(
                 ["git", "apply", "--reverse", "--check", str(patch_path)],
@@ -1932,6 +1960,7 @@ def _push_candidate_source_diff_to_repo(
                     "candidate_manifest_git_commit_sha": candidate_manifest_sha,
                     "target_files": target_files,
                     "source_diff_hash": source_diff_hash,
+                    "patch_normalized": patch_normalized,
                 }
             raise RuntimeError("candidate source diff does not apply to private source branch")
 
@@ -1944,6 +1973,7 @@ def _push_candidate_source_diff_to_repo(
                 "candidate_manifest_git_commit_sha": candidate_manifest_sha,
                 "target_files": target_files,
                 "source_diff_hash": source_diff_hash,
+                "patch_normalized": patch_normalized,
             }
         _run_command(["git", "config", "user.name", os.getenv("RESEARCH_LAB_PRIVATE_REPO_GIT_AUTHOR_NAME", "Leadpoet Research Lab")], cwd=worktree, timeout_seconds=10)
         _run_command(["git", "config", "user.email", os.getenv("RESEARCH_LAB_PRIVATE_REPO_GIT_AUTHOR_EMAIL", "research-lab@leadpoet.ai")], cwd=worktree, timeout_seconds=10)
@@ -1964,9 +1994,47 @@ def _push_candidate_source_diff_to_repo(
             "candidate_manifest_git_commit_sha": candidate_manifest_sha,
             "target_files": target_files,
             "source_diff_hash": source_diff_hash,
+            "patch_normalized": patch_normalized,
         }
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _normalize_unified_diff_hunk_headers(unified_diff: str) -> str:
+    """Repair incorrect hunk line counts while preserving diff contents."""
+    lines = unified_diff.splitlines()
+    hunk_header = re.compile(
+        r"^@@ -(?P<old_start>\d+)(?:,\d+)? \+(?P<new_start>\d+)(?:,\d+)? @@(?P<suffix>.*)$"
+    )
+    out = list(lines)
+    index = 0
+    while index < len(lines):
+        match = hunk_header.match(lines[index])
+        if not match:
+            index += 1
+            continue
+        old_count = 0
+        new_count = 0
+        cursor = index + 1
+        while cursor < len(lines) and not lines[cursor].startswith("diff --git ") and not lines[cursor].startswith("@@ "):
+            line = lines[cursor]
+            if line.startswith("\\"):
+                cursor += 1
+                continue
+            if line.startswith("+"):
+                new_count += 1
+            elif line.startswith("-"):
+                old_count += 1
+            else:
+                old_count += 1
+                new_count += 1
+            cursor += 1
+        out[index] = (
+            f"@@ -{match.group('old_start')},{old_count} "
+            f"+{match.group('new_start')},{new_count} @@{match.group('suffix')}"
+        )
+        index = cursor
+    return "\n".join(out) + ("\n" if unified_diff.endswith("\n") else "")
 
 
 def _safe_target_files(value: Any) -> list[str]:
